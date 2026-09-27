@@ -203,6 +203,31 @@ If you need to delete the local `kind` cluster and its registry (if it was creat
 ./hack/delete-kind-cluster.sh
 ```
 
+## Helm chart
+
+For a chart-managed install on any cluster (not just the kind/GKE quickstart
+flows above), install directly from the published chart:
+
+```bash
+helm install substrate oci://ghcr.io/rashadism/substrate/helm/substrate \
+  --version 0.2.0 -n ate-system --create-namespace \
+  --set image.tag=v0.2.0
+```
+
+That's the whole install: CRDs are applied automatically (Helm's native
+`crds/` handling), and a `pre-install,pre-upgrade` hook bootstraps the mTLS CA
+pools and the API authentication config before anything else comes up. See
+[`charts/substrate`](charts/substrate) for what it ships — every control-plane
+and data-plane component, plus a default `WorkerPool`.
+
+Prerequisites are the same Kubernetes beta APIs as above (`ClusterTrustBundle`,
+`ClusterTrustBundleProjection`, `PodCertificateRequest`,
+`certificates.k8s.io/v1beta1`), enabled at cluster creation — the chart can't
+set those up for itself.
+
+Node labeling for autoscaled node pools: see the `substrateVersion` comment
+in [`values.yaml`](charts/substrate/values.yaml) and [`docs/upgrade.md`](docs/upgrade.md).
+
 ## Demos
 
 We provide several sample applications demonstrating Agent Substrate's capabilities:
