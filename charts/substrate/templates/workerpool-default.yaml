@@ -1,0 +1,23 @@
+{{- if .Values.workerPool.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.workerPool.namespace }}
+---
+apiVersion: ate.dev/v1alpha1
+kind: WorkerPool
+metadata:
+  name: {{ .Values.workerPool.name }}
+  namespace: {{ .Values.workerPool.namespace }}
+  labels:
+    workload: {{ .Values.workerPool.workload }}
+spec:
+  replicas: {{ .Values.workerPool.replicas }}
+  workerImage: {{ .Values.image.registry }}/ateom-gvisor:{{ .Values.image.tag }}
+  sandboxClass: gvisor
+  template:
+    labels:
+      workload: {{ .Values.workerPool.workload }}
+    resources:
+      {{- toYaml .Values.workerPool.resources | nindent 6 }}
+{{- end }}
