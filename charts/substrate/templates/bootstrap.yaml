@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: substrate-bootstrap
+  namespace: ate-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: substrate-bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "secrets", "configmaps"]
+  # get+create+patch: several of ate-setup's create steps use server-side
+  # apply, which PATCHes even on first creation.
+  verbs: ["get", "create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: substrate-bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation
+subjects:
+- kind: ServiceAccount
+  name: substrate-bootstrap
+  namespace: ate-system
+roleRef:
+  kind: ClusterRole
+  name: substrate-bootstrap
+  apiGroup: rbac.authorization.k8s.io
+---
+# ate-setup resolves its repo root by walking up from the working directory
+# looking for a go.mod (cmd/ate-setup/internal/config/shellenv.go:RepoRoot),
+# and refuses to run at all without one — even though the create subcommands
+# below never read a repo-relative path. A one-line placeholder at the
+# working directory satisfies the check; ate-setup only stats for existence.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: substrate-bootstrap-workdir
+  namespace: ate-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-2"
+    "helm.sh/hook-delete-policy": before-hook-creation
+data:
+  go.mod: "module substrate-bootstrap-workdir\n"
+---
+# Creates the CA pools and config ate-system's components assume exist: the
+# podcertificate-controller's servicedns/podidentity CAs, the actor identity
+# JWT and CA pools, and the ate-api-server authentication config. ate-setup's
+# own create subcommands are idempotent (they skip anything that already
+# exists), so this hook is safe to re-run on every upgrade. One container per
+# step: the ate-setup image is distroless, so a shell loop isn't an option.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: substrate-bootstrap
+  namespace: ate-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 6
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      serviceAccountName: substrate-bootstrap
+      restartPolicy: Never
+      initContainers:
+      - name: podcertificate-controller-cas
+        image: {{ .Values.image.registry }}/ate-setup:{{ .Values.image.tag }}
+        workingDir: /work
+        args: ["create", "podcertificate-controller-cas"]
+        volumeMounts: [{name: workdir, mountPath: /work}]
+      - name: jwt-authority-pool
+        image: {{ .Values.image.registry }}/ate-setup:{{ .Values.image.tag }}
+        workingDir: /work
+        args: ["create", "jwt-authority-pool"]
+        volumeMounts: [{name: workdir, mountPath: /work}]
+      - name: actor-id-ca-pool
+        image: {{ .Values.image.registry }}/ate-setup:{{ .Values.image.tag }}
+        workingDir: /work
+        args: ["create", "actor-id-ca-pool"]
+        volumeMounts: [{name: workdir, mountPath: /work}]
+      - name: actor-id-ca-certs
+        image: {{ .Values.image.registry }}/ate-setup:{{ .Values.image.tag }}
+        workingDir: /work
+        args: ["create", "actor-id-ca-certs"]
+        volumeMounts: [{name: workdir, mountPath: /work}]
+      containers:
+      - name: api-authentication-config
+        image: {{ .Values.image.registry }}/ate-setup:{{ .Values.image.tag }}
+        workingDir: /work
+        args: ["create", "api-authentication-config"]
+        volumeMounts: [{name: workdir, mountPath: /work}]
+      volumes:
+      - name: workdir
+        configMap:
+          name: substrate-bootstrap-workdir
