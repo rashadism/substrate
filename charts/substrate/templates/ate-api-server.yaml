@@ -1,0 +1,242 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ate-api-server
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["ate.dev"]
+  resources: ["workerpools", "sandboxconfigs", "csidriverconfigs"]
+  verbs: ["get", "watch", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
+  verbs: ["get", "watch", "list"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ate-api-server
+subjects:
+- kind: ServiceAccount
+  name: ate-api-server
+  namespace: ate-system
+roleRef:
+  kind: ClusterRole
+  name: ate-api-server
+  apiGroup: rbac.authorization.k8s.io
+---
+# The bundled Postgres (templates/postgres.yaml) needs a client-cert DSN, not
+# a password — pg_hba.conf requires clientcert=verify-ca over the network.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ate-api-server-secret-envvars
+  namespace: ate-system
+stringData:
+  ATE_API_POSTGRES_CONNECTION_STRING: "postgres://postgres@postgres.ate-system.svc:5432/atepg?sslmode=verify-ca&sslcert=/run/podidentity.podcert.ate.dev/credential-bundle.pem&sslkey=/run/podidentity.podcert.ate.dev/credential-bundle.pem&sslrootcert=/run/servicedns.podcert.ate.dev/trust-bundle.pem"
+  ATE_API_POSTGRES_SCHEMA: public
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+spec:
+  replicas: {{ .Values.ateApiServer.replicas }}
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: ate-api-server
+  template:
+    metadata:
+      labels:
+        app: ate-api-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: ate-api-server
+      terminationGracePeriodSeconds: 40
+      containers:
+      - name: ate-api-server
+        image: {{ .Values.image.registry }}/ateapi:{{ .Values.image.tag }}
+        args:
+          - "--grpc-server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+          - --authentication-config=/etc/ateapi/authentication/authentication.yaml
+          - --postgres-connection-string=@env
+          - --postgres-schema=@env
+          - --actor-id-jwt-pool=/run/actor-id-jwt-pool/pool.json
+          - --actor-id-ca-pool=/run/actor-id-ca-pool/pool.json
+          - --atelet-client-cred-bundle=/run/podidentity.podcert.ate.dev/credential-bundle.pem
+          - --pod-identity-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
+          - --egress-gateway-address=atenet-egress.ate-system.svc:443
+          - --drain-delay=13s
+          - --drain-timeout=15s
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: OTEL_RESOURCE_ATTRIBUTES
+          value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),service.instance.id=$(POD_UID)
+        - name: ATE_STORAGE_BACKEND
+          value: "s3"
+        - name: AWS_REGION
+          value: us-east-1
+        - name: AWS_ENDPOINT_URL
+          value: http://rustfs.ate-system.svc:9000
+        - name: AWS_S3_USE_PATH_STYLE
+          value: "true"
+        - name: AWS_ACCESS_KEY_ID
+          value: {{ .Values.rustfs.accessKey | quote }}
+        - name: AWS_SECRET_ACCESS_KEY
+          value: {{ .Values.rustfs.secretKey | quote }}
+        envFrom:
+        - configMapRef:
+            name: ate-otel-config
+        - configMapRef:
+            name: ate-api-server-envvars
+            optional: true
+        - secretRef:
+            name: ate-api-server-secret-envvars
+            optional: true
+        volumeMounts:
+        - name: "servicedns"
+          mountPath: "/run/servicedns.podcert.ate.dev"
+        - name: "podidentity"
+          mountPath: "/run/podidentity.podcert.ate.dev"
+        - name: "actor-id-jwt-pool"
+          mountPath: "/run/actor-id-jwt-pool"
+        - name: "actor-id-ca-pool"
+          mountPath: "/run/actor-id-ca-pool"
+          readOnly: true
+        - name: "authentication-config"
+          mountPath: "/etc/ateapi/authentication"
+          readOnly: true
+        - name: "postgres-server-ca"
+          mountPath: "/run/postgres-server-ca"
+          readOnly: true
+        ports:
+        - containerPort: 443
+        - name: prometheus
+          containerPort: 9090
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          failureThreshold: 3
+        # :9090 is bound near the end of boot, after the store connect and
+        # the schema migrations, so nothing answers here until both finish.
+        # The store connect alone budgets 60s (30 attempts, 2s apart) and the
+        # migrations serialize across replicas on an advisory lock. Without a
+        # startup probe the liveness probe below SIGTERMs the container at
+        # ~30s, halfway through that budget.
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          periodSeconds: 5
+          failureThreshold: 24
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: "servicedns"
+        projected:
+          sources:
+          - podCertificate:
+              signerName: servicedns.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+      - name: "podidentity"
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem
+          - clusterTrustBundle:
+              signerName: podidentity.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels:
+                  podcert.ate.dev/canarying: live
+              path: trust-bundle.pem
+      - name: "actor-id-jwt-pool"
+        projected:
+          sources:
+          - secret:
+              name: "actor-id-jwt-pool"
+              items:
+              - key: "pool"
+                path: "pool.json"
+      - name: "actor-id-ca-pool"
+        projected:
+          sources:
+          - secret:
+              name: "actor-id-ca-pool"
+              items:
+              - key: "pool"
+                path: "pool.json"
+      - name: "authentication-config"
+        configMap:
+          name: "ate-api-authentication"
+      - name: "postgres-server-ca"
+        secret:
+          secretName: "postgres-server-ca"
+          optional: true
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ate-api-server
+  namespace: ate-system
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: ate-api-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: ate-system
+spec:
+  clusterIP: None
+  ipFamilyPolicy: PreferDualStack
+  selector:
+    app: ate-api-server
+  ports:
+  - name: grpc
+    protocol: TCP
+    port: 443
+    targetPort: 443

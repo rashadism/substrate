@@ -1,0 +1,59 @@
+image:
+  registry: ghcr.io/rashadism/substrate
+  tag: ""
+
+# ate.dev/substrate-version: what atelet's nodeSelector requires on a node.
+# Defaults to image.tag. Set this at the node-pool level (e.g. `gcloud
+# container node-pools update --node-labels=...`), not per-node: a node a
+# pool creates later (autoscaling, resize) must arrive with this label
+# already on it, or nothing schedules there. See docs/upgrade.md upstream.
+substrateVersion: ""
+
+# Every component reads this via a non-optional envFrom, so it must exist
+# even with no collector behind it — an unreachable OTLP endpoint is dropped
+# by the exporter, not fatal to the process.
+otelEndpoint: http://localhost:4317
+
+postgres:
+  storage: 1Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+rustfs:
+  storage: 1Gi
+  bucket: ate-snapshots
+  accessKey: rustfsadmin
+  secretKey: rustfsadmin
+
+atelet:
+  # Set true when actor images live in a private GCP Artifact Registry/GCR
+  # repo: atelet's own image-pull client (separate from kubelet's, and not
+  # covered by the node's default AR credentials) then authenticates with the
+  # node's service account. Leave false for public registries.
+  gcpAuthForImagePulls: false
+
+ateApiServer:
+  replicas: 1
+
+# The default WorkerPool this chart creates. `workload` is the label
+# ActorTemplates select on via workerSelector.matchLabels — it must match
+# whatever the consuming ComponentType (e.g. oc-substrate's
+# openchoreo.componentType.workerSelector.workload) is configured with.
+workerPool:
+  create: true
+  name: default
+  namespace: ate-workers
+  workload: default
+  replicas: 3
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 1Gi
