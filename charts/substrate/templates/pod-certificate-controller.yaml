@@ -1,8 +1,6 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: podcertificate-controller-system
----
+# podcertificate-controller-system is created by the bootstrap hook's
+# ate-setup create podcertificate-controller-cas step, which needs the
+# namespace to exist before it can write the CA secrets into it.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
