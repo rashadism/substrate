@@ -188,7 +188,7 @@ spec:
           periodSeconds: 10
         volumeMounts:
         - name: run-ateom
-          mountPath: /var/lib/ateom-gvisor
+          mountPath: /var/lib/ate
         - name: podidentity
           mountPath: /run/podidentity.podcert.ate.dev
         - name: servicedns-ca
@@ -204,7 +204,7 @@ spec:
       volumes:
       - name: run-ateom
         hostPath:
-          path: /var/lib/ateom-gvisor
+          path: /var/lib/ate
           type: DirectoryOrCreate
       - name: kubelet-plugins
         hostPath:
