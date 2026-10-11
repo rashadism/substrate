@@ -100,6 +100,10 @@ young.  Our immediate focus is on building out the core system and demos, so we
 may not be able to review or merge contributions that don't align with those
 goals in the near term.
 
+## Helm Charts
+
+Two charts under `charts/` package an install: [`substrate`](charts/substrate/README.md) (the control plane — CRDs, identity/CA bootstrap, pod-certificate controller, `atelet`, `ate-controller`, `ate-api-server`, `atenet-router`, `atenet-egress`, rustfs, a default `SandboxConfig`) and [`substrate-postgres`](charts/substrate-postgres/README.md) (bundled, certificate-authenticated PostgreSQL). Install `substrate` first, then `substrate-postgres` and its one manual role/schema step. See each chart's README for values and prerequisites.
+
 ## Quickstart (Development)
 
 To quickly set up the complete environment:
