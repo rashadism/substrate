@@ -1,0 +1,16 @@
+This chart does not create the database roles, schema, or grants on its
+own — only the server and the connection Secrets pointing at certificates
+that don't authorize anything until the roles exist. Once the StatefulSet
+is ready, run the role/schema setup once, from the root of this checkout
+(idempotent — safe to re-run):
+
+kubectl exec -i -n ate-system postgres-0 -c postgres -- \
+  psql --no-psqlrc --set=ON_ERROR_STOP=1 --username postgres --dbname atepg \
+  --set=substrate_schema={{ .Values.postgres.schema }} \
+  --set=substrate_owner_role={{ .Values.postgres.ownerRole }} \
+  --set=substrate_owner_user={{ .Values.postgres.ownerUser }} \
+  --set=substrate_owner_password= \
+  --set=substrate_readwrite_role={{ .Values.postgres.readWriteRole }} \
+  --set=substrate_readwrite_user={{ .Values.postgres.readWriteUser }} \
+  --set=substrate_readwrite_password= \
+  < pkg/postgressetup/setup.sql

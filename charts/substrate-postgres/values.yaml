@@ -1,0 +1,22 @@
+image: "postgres:18-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15"
+storage: 20Gi
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+connectionSecrets:
+  readWrite: substrate-postgres-readwrite
+  owner: substrate-postgres-owner
+
+# Schema/role/user identities the SQL in templates/NOTES.txt creates. The
+# substrate chart's postgres.schema/ownerRole/readWriteRole must match these.
+postgres:
+  schema: substrate
+  ownerRole: substrate_owner
+  ownerUser: substrate_owner_user
+  readWriteRole: substrate_readwrite
+  readWriteUser: substrate_readwrite_user
