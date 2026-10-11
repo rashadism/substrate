@@ -1,0 +1,6 @@
+apiVersion: v2
+name: substrate
+description: Agent Substrate — a Kubernetes-based runtime for sandboxed, mostly-idle agent workloads, multiplexed onto warm worker pools with fast suspend/resume.
+type: application
+version: 0.1.0
+appVersion: "0.4.0"

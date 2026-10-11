@@ -1,0 +1,17 @@
+apiVersion: ate.dev/v1alpha1
+kind: SandboxConfig
+metadata:
+  name: gvisor-default
+  annotations:
+    sandboxconfig.ate.dev/is-class-default: "true"
+spec:
+  sandboxClass: gvisor
+  defaultVersion: {{ .Values.sandboxConfig.gvisor.defaultVersion }}
+  versions:
+  {{- range .Values.sandboxConfig.gvisor.versions }}
+  - name: {{ .name }}
+    state: {{ .state }}
+    pauseImage: {{ .pauseImage | quote }}
+    assets:
+      {{- toYaml .assets | nindent 6 }}
+  {{- end }}

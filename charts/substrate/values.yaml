@@ -1,0 +1,86 @@
+# Every component shares this OTLP endpoint via envFrom. Logs/metrics are
+# out of scope for this chart, so it only needs to exist.
+otel:
+  endpoint: "http://localhost:4317"
+
+# No pre-built image is published for any component here - build from source.
+ateSetup:
+  image: ""
+
+podCertificateController:
+  image: ""
+  workersPerSigner: "1"
+
+atelet:
+  image: ""
+  snapshotPluginImage: ""
+  # GKE's kubelet credential-provider paths; other node distributions differ.
+  imageCredentialProviderBinDir: "/home/kubernetes/bin"
+  imageCredentialProviderConfig: "/etc/srv/kubernetes/cri_auth_config.yaml"
+
+ateController:
+  image: ""
+
+ateApiServer:
+  image: ""
+  snapshotPluginImage: ""
+  replicas: 2
+  # Issuer in actor JWTs' iss claim; must be HTTPS with no query/fragment.
+  # Defaults to this chart's own api Service, which publishes the discovery
+  # document relying parties fetch.
+  actorJWTIssuer: "https://api.ate-system.svc"
+
+atenetRouter:
+  image: ""
+  envoyImage: "envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
+
+atenetEgress:
+  image: ""
+  # Upstream substitutes this outside kustomize (${ENVOY_DATAPLANE_IMAGE}), so
+  # there's no natural default; defaults here to the router's Envoy build.
+  envoyImage: "envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
+
+# GKE-only (monitoring.googleapis.com/v1 PodMonitoring); off by default to
+# keep the chart cloud-neutral.
+gcpManagedPrometheus:
+  enabled: false
+
+rustfs:
+  image: "rustfs/rustfs:1.0.0-beta.3@sha256:378642b05b7dcb4849fb77ebe6aca4ced1c3f66e7e504247df95a5c9018d3358"
+  bucketInitImage: "amazon/aws-cli:2.17.0@sha256:643507c10ada7964ca6157b3d799f030b90577643da9955d319a77399ed80d73"
+  bucket: ate-snapshots
+  storage: 1Gi
+  # Left unset: the chart generates and persists a random pair in a Secret on
+  # first install. Set both to pin specific values.
+  accessKey: ""
+  secretKey: ""
+
+# Connection strings come from Secrets rendered by the substrate-postgres
+# chart (or your own, for an externally managed database). schema/ownerRole/
+# readWriteRole must match that chart's own postgres.* values.
+postgres:
+  readWriteConnectionStringSecretRef:
+    name: substrate-postgres-readwrite
+  ownerConnectionStringSecretRef:
+    name: substrate-postgres-owner
+  schema: substrate
+  ownerRole: substrate_owner
+  readWriteRole: substrate_readwrite
+
+sandboxConfig:
+  gvisor:
+    defaultVersion: v1
+    versions:
+    - name: v1
+      state: Enabled
+      # On GCP, prefer gcr.io/gke-release/pause@sha256:bcbd57ba5653580ec647b16d8163cdd1112df3609129b01f912a8032e48265da
+      pauseImage: "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
+      assets:
+        amd64:
+          gvisor:
+            url: "gs://gvisor/releases/nightly/2026-09-02/x86_64/gvisor.tar.zstd"
+            sha256: "d547d81401461fd1c679c5c4fa0a6c2b8ef7dc3c22ce23c9e25dcc4c69cfd06f"
+        arm64:
+          gvisor:
+            url: "gs://gvisor/releases/nightly/2026-09-02/aarch64/gvisor.tar.zstd"
+            sha256: "a64916f9813ce7e4841a30480a599337f7dda07b421c6bf0123db2212aa7d1df"

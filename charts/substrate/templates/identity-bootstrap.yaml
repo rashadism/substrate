@@ -1,0 +1,168 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: substrate-identity-bootstrap
+  namespace: ate-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+# Namespace create/get/patch is cluster-scoped. `create` can't be
+# resourceName-scoped since the object doesn't exist yet when RBAC checks.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: substrate-identity-bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "patch"]
+  resourceNames: ["ate-system", "podcertificate-controller-system"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: substrate-identity-bootstrap
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: substrate-identity-bootstrap
+subjects:
+- kind: ServiceAccount
+  name: substrate-identity-bootstrap
+  namespace: ate-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: substrate-identity-bootstrap
+  namespace: ate-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+  resourceNames: ["actor-id-jwt-pool", "actor-id-ca-pool", "egress-mitm-ca-pool"]
+# actor-id-ca-certs is derived from actor-id-ca-pool via a PATCH on every
+# run, unlike the existence-checked creates above, so it needs patch too.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "patch"]
+  resourceNames: ["actor-id-ca-certs"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "patch"]
+  resourceNames: ["ate-api-authentication"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: substrate-identity-bootstrap
+  namespace: ate-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: substrate-identity-bootstrap
+subjects:
+- kind: ServiceAccount
+  name: substrate-identity-bootstrap
+  namespace: ate-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: substrate-identity-bootstrap
+  namespace: podcertificate-controller-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+  resourceNames: ["service-dns-ca-pool", "pod-identity-ca-pool", "postgres-ca-pool"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: substrate-identity-bootstrap
+  namespace: podcertificate-controller-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: substrate-identity-bootstrap
+subjects:
+- kind: ServiceAccount
+  name: substrate-identity-bootstrap
+  namespace: ate-system
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: substrate-identity-bootstrap
+  namespace: ate-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: substrate-identity-bootstrap
+      restartPolicy: Never
+      containers:
+      - name: identity-bootstrap
+        image: {{ .Values.ateSetup.image }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          # api-authentication-config creates the ate-system namespace, and
+          # must run before the steps below that assume it exists.
+          ate-setup create podcertificate-controller-cas
+          ate-setup create api-authentication-config
+          ate-setup create jwt-authority-pool
+          ate-setup create actor-id-ca-pool
+          ate-setup create actor-id-ca-certs
+          ate-setup create egress-mitm-ca-pool
