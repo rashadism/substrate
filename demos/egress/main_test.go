@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -25,15 +26,19 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
-	"github.com/agent-substrate/substrate/internal/proto/grpcechopb"
-	"github.com/agent-substrate/substrate/internal/testcert"
+	"go.ate.dev/substrate/internal/proto/grpcechopb"
+	"go.ate.dev/substrate/internal/testcert"
 )
 
 func TestFetch(t *testing.T) {
@@ -632,6 +637,393 @@ func TestGRPCInvalidRequests(t *testing.T) {
 			handler.ServeHTTP(recorder, request)
 			if recorder.Code != test.status {
 				t.Errorf("status = %d, want %d; body = %s", recorder.Code, test.status, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestMux(t *testing.T) {
+	var completed atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/fetch" {
+			t.Errorf("path = %s, want /fetch", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(body) != muxBodySize {
+			t.Errorf("len(body) = %d, want %d", len(body), muxBodySize)
+		}
+		completed.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	payload, err := json.Marshal(fetchRequest{URL: srv.URL + "/fetch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/mux", strings.NewReader(string(payload)))
+	newHandler(http.DefaultClient).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := int(completed.Load()); got != muxRequestCount {
+		t.Errorf("completed = %d, want %d", got, muxRequestCount)
+	}
+}
+
+func TestMuxNon200Fails(t *testing.T) {
+	var seen atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if int(seen.Add(1)) == muxRequestCount {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	payload, err := json.Marshal(fetchRequest{URL: srv.URL + "/fetch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/mux", strings.NewReader(string(payload)))
+	newHandler(http.DefaultClient).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+}
+
+func TestMuxInvalidRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		body   string
+		status int
+	}{
+		{name: "method", method: http.MethodGet, body: `{}`, status: http.StatusMethodNotAllowed},
+		{name: "malformed JSON", method: http.MethodPost, body: `{`, status: http.StatusBadRequest},
+		{name: "missing hostname", method: http.MethodPost, body: `{"url":"http:///path"}`, status: http.StatusBadRequest},
+		{name: "https scheme", method: http.MethodPost, body: `{"url":"https://example.com/fetch"}`, status: http.StatusBadRequest},
+	}
+
+	handler := newHandler(http.DefaultClient)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(test.method, "/mux", strings.NewReader(test.body))
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != test.status {
+				t.Errorf("status = %d, want %d; body = %s", recorder.Code, test.status, recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestPost(t *testing.T) {
+	headersReceived := make(chan struct{})
+	var bodyBytes atomic.Int32
+	srv, rootCA := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/fetch" {
+			t.Errorf("path = %s, want /fetch", r.URL.Path)
+		}
+		close(headersReceived)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		bodyBytes.Store(int32(len(body)))
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/post", handlePost(50*time.Millisecond))
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postHandler(t, mux, "/post", fetchRequest{
+			URL:    srv.URL + "/fetch",
+			RootCA: rootCA,
+		})
+	}()
+
+	<-headersReceived
+	if got := bodyBytes.Load(); got != 0 {
+		t.Fatalf("body bytes immediately after headers = %d, want 0", got)
+	}
+
+	rec := <-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/post status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := int(bodyBytes.Load()); got != muxBodySize {
+		t.Errorf("body bytes after /post completed = %d, want %d", got, muxBodySize)
+	}
+}
+
+func TestPostInvalidRequests(t *testing.T) {
+	handler := newHandler(http.DefaultClient)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/post", nil)
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+		}
+	})
+	t.Run("invalid rootCA", func(t *testing.T) {
+		recorder := postHandler(t, handler, "/post", fetchRequest{
+			URL:    "https://example.com/fetch",
+			RootCA: "not-a-cert",
+		})
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	})
+}
+
+func TestSlowHeaders(t *testing.T) {
+	headersCompleted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		close(headersCompleted)
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow-headers", handleSlowHeaders(80*time.Millisecond))
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- postHandler(t, mux, "/slow-headers", fetchRequest{
+			URL: srv.URL + "/",
+		})
+	}()
+
+	select {
+	case <-headersCompleted:
+		t.Fatal("headers completed before headerDelay elapsed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	<-headersCompleted
+	rec := <-done
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/slow-headers status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+func TestSlowHeadersInvalidRequests(t *testing.T) {
+	handler := newHandler(http.DefaultClient)
+
+	t.Run("method not allowed", func(t *testing.T) {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/slow-headers", nil)
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+		}
+	})
+	t.Run("https rejected", func(t *testing.T) {
+		recorder := postHandler(t, handler, "/slow-headers", fetchRequest{
+			URL: "https://example.net/",
+		})
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	})
+}
+
+// startProxyStub listens on loopback and answers the first CONNECT on each
+// connection with answer, verbatim, then holds the connection open until the
+// test ends -- as a proxy that opened the tunnel would. It returns its
+// host:port and a function listing the request lines it received so far.
+func startProxyStub(t *testing.T, answer string) (string, func() []string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	var mu sync.Mutex
+	var received []string
+	done := make(chan struct{})
+	t.Cleanup(func() { listener.Close(); close(done) })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				request, err := http.ReadRequest(bufio.NewReader(conn))
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				received = append(received, request.Method+" "+request.Host)
+				mu.Unlock()
+				_, _ = io.WriteString(conn, answer)
+				<-done
+			}()
+		}
+	}()
+	return listener.Addr().String(), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(received)
+	}
+}
+
+func TestConnectReportsRefusal(t *testing.T) {
+	proxy, received := startProxyStub(t, "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\n\r\ndenied")
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443"})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusForbidden || got.Body != "denied" || got.Protocol != "HTTP/1.1" || got.TLS || got.Error != "" {
+		t.Errorf("response = %+v, want the proxy's 403 and body in the clear", got)
+	}
+	if got, want := received(), []string{"CONNECT example.com:443"}; !slices.Equal(got, want) {
+		t.Errorf("proxy received %q, want %q", got, want)
+	}
+}
+
+// A 2xx has no body: the connection is the tunnel now, and the proxy stub
+// sends nothing further, so a handler that tried to read one would hang.
+func TestConnectReportsOpenedTunnelWithoutWaitingForBody(t *testing.T) {
+	proxy, _ := startProxyStub(t, "HTTP/1.1 200 Connection established\r\n\r\n")
+	start := time.Now()
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443"})
+	if elapsed := time.Since(start); elapsed > requestTimeout/2 {
+		t.Errorf("answering a 200 took %v; the handler waited on a body the tunnel never sends", elapsed)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusOK || got.Body != "" || got.Error != "" {
+		t.Errorf("response = %+v, want an opened tunnel with no body", got)
+	}
+}
+
+func TestConnectOverTLS(t *testing.T) {
+	server, rootCA := startIPTLSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "not a CONNECT", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "no tunnels here", http.StatusForbidden)
+	}))
+	proxy := strings.TrimPrefix(server.URL, "https://")
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443", TLS: true, RootCA: rootCA})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if got.StatusCode != http.StatusForbidden || !got.TLS || strings.TrimSpace(got.Body) != "no tunnels here" || got.Error != "" {
+		t.Errorf("response = %+v, want the proxy's 403 over verified TLS", got)
+	}
+
+	// Without the root the handshake fails, and that is a failure to get an
+	// answer, not an answer.
+	recorder = postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443", TLS: true})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status without a root = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var unverified connectResponse
+	decodeRecorder(t, recorder, &unverified)
+	if unverified.StatusCode != 0 || !strings.Contains(unverified.Error, "TLS handshake") {
+		t.Errorf("response without a root = %+v, want a TLS handshake error and no status", unverified)
+	}
+}
+
+// A rootCA that is not a certificate is refused before anything is dialed:
+// the proxy here refuses connections, so a handler that dialed first would
+// report that instead.
+func TestConnectRejectsBadRootCABeforeDialing(t *testing.T) {
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	proxy := closed.Addr().String()
+	closed.Close()
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443", TLS: true, RootCA: "not-a-pem"})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if !strings.Contains(got.Error, "rootCA") || strings.Contains(got.Error, "dialing") {
+		t.Errorf("error = %q, want the rootCA rejection and no dial", got.Error)
+	}
+}
+
+func TestConnectReportsUnreachableProxy(t *testing.T) {
+	// A port that was just listening and is now closed refuses the connection.
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening on loopback: %v", err)
+	}
+	proxy := closed.Addr().String()
+	closed.Close()
+
+	recorder := postHandler(t, newHandler(http.DefaultClient), "/connect", connectRequest{Proxy: proxy, Target: "example.com:443"})
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body = %s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	var got connectResponse
+	decodeRecorder(t, recorder, &got)
+	if !strings.Contains(got.Error, "dialing proxy "+proxy) {
+		t.Errorf("error = %q, want the dial failure", got.Error)
+	}
+}
+
+func TestConnectRejectsInvalidRequests(t *testing.T) {
+	handler := newHandler(http.DefaultClient)
+	for name, tc := range map[string]struct {
+		method string
+		body   string
+		want   int
+	}{
+		"GET":                {http.MethodGet, `{"proxy":"127.0.0.1:3128","target":"example.com:443"}`, http.StatusMethodNotAllowed},
+		"not JSON":           {http.MethodPost, `proxy`, http.StatusBadRequest},
+		"no proxy":           {http.MethodPost, `{"target":"example.com:443"}`, http.StatusBadRequest},
+		"proxy without port": {http.MethodPost, `{"proxy":"127.0.0.1","target":"example.com:443"}`, http.StatusBadRequest},
+		"no target":          {http.MethodPost, `{"proxy":"127.0.0.1:3128"}`, http.StatusBadRequest},
+		"target with scheme": {http.MethodPost, `{"proxy":"127.0.0.1:3128","target":"https://example.com:443"}`, http.StatusBadRequest},
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(tc.method, "/connect", strings.NewReader(tc.body)))
+			if recorder.Code != tc.want {
+				t.Errorf("status = %d, want %d; body = %s", recorder.Code, tc.want, recorder.Body.String())
 			}
 		})
 	}

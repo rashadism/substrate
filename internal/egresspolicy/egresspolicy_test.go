@@ -19,34 +19,34 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
 )
 
-func httpRule(patterns ...string) *ateapipb.EgressRule {
-	return &ateapipb.EgressRule{Http: &ateapipb.HTTPRule{Hostnames: patterns}}
+func httpRule(patterns ...string) *ateapi.EgressRule {
+	return &ateapi.EgressRule{Http: &ateapi.HttpRule{Hostnames: patterns}}
 }
 
-func httpRuleOnPorts(ports *ateapipb.Ports, patterns ...string) *ateapipb.EgressRule {
-	return &ateapipb.EgressRule{Http: &ateapipb.HTTPRule{Hostnames: patterns, Ports: ports}}
+func httpRuleOnPorts(ports *ateapi.Ports, patterns ...string) *ateapi.EgressRule {
+	return &ateapi.EgressRule{Http: &ateapi.HttpRule{Hostnames: patterns, Ports: ports}}
 }
 
-func httpsRule(patterns ...string) *ateapipb.EgressRule {
-	return &ateapipb.EgressRule{Https: &ateapipb.HTTPSRule{Hostnames: patterns}}
+func httpsRule(patterns ...string) *ateapi.EgressRule {
+	return &ateapi.EgressRule{Https: &ateapi.HttpsRule{Hostnames: patterns}}
 }
 
-func passthroughRule(ports *ateapipb.Ports, patterns ...string) *ateapipb.EgressRule {
-	return &ateapipb.EgressRule{TlsPassthrough: &ateapipb.TLSPassthroughRule{Hostnames: patterns, Ports: ports}}
+func passthroughRule(ports *ateapi.Ports, patterns ...string) *ateapi.EgressRule {
+	return &ateapi.EgressRule{TlsPassthrough: &ateapi.TlsPassthroughRule{Hostnames: patterns, Ports: ports}}
 }
 
-func ports(numbers ...int32) *ateapipb.Ports { return &ateapipb.Ports{Numbers: numbers} }
+func ports(numbers ...int32) *ateapi.Ports { return &ateapi.Ports{Numbers: numbers} }
 
-func allPorts() *ateapipb.Ports { return &ateapipb.Ports{All: &ateapipb.AllPorts{}} }
+func allPorts() *ateapi.Ports { return &ateapi.Ports{All: &ateapi.AllPorts{}} }
 
-func policy(rules ...*ateapipb.EgressRule) *ateapipb.EgressPolicy {
-	return &ateapipb.EgressPolicy{Rules: rules}
+func policy(rules ...*ateapi.EgressRule) *ateapi.EgressPolicy {
+	return &ateapi.EgressPolicy{Rules: rules}
 }
 
-func mustCompile(t *testing.T, p *ateapipb.EgressPolicy) *Policy {
+func mustCompile(t *testing.T, p *ateapi.EgressPolicy) *Policy {
 	t.Helper()
 	compiled, errs := Compile(p)
 	if len(errs) != 0 {
@@ -186,6 +186,34 @@ func TestNormalizeAuthority(t *testing.T) {
 	}
 }
 
+func TestNormalizeHostname(t *testing.T) {
+	tests := []struct {
+		raw    string
+		want   string
+		wantOK bool
+	}{
+		{raw: "example.com", want: "example.com", wantOK: true},
+		{raw: "example.com.", want: "example.com", wantOK: true},
+		{raw: "API.Example.COM.", want: "api.example.com", wantOK: true},
+		{raw: "xn--bcher-kva.example.", want: "xn--bcher-kva.example", wantOK: true},
+		{raw: "", wantOK: false},
+		{raw: ".", wantOK: false},
+		{raw: "example.com..", wantOK: false},
+		{raw: "192.0.2.1", wantOK: false},
+		{raw: "192.0.2.1.", wantOK: false},
+		{raw: "01.2.3.4.", wantOK: false},
+		{raw: "_dmarc.example.com.", wantOK: false},
+		{raw: "bücher.example.", wantOK: false},
+		{raw: "*.example.com", wantOK: false},
+	}
+	for _, tc := range tests {
+		got, ok := NormalizeHostname(tc.raw)
+		if ok != tc.wantOK || got != tc.want {
+			t.Errorf("NormalizeHostname(%q) = (%q, %v), want (%q, %v)", tc.raw, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
 func TestCompileReportsAndDropsInvalidEntries(t *testing.T) {
 	compiled, errs := Compile(policy(
 		httpRule("good.example.com", "BAD.example.com"),
@@ -207,21 +235,21 @@ func TestCompileReportsAndDropsInvalidEntries(t *testing.T) {
 }
 
 func TestEvaluateRequest(t *testing.T) {
-	effects := &ateapipb.HttpRuleEffects{
-		ReplaceHeaders: []*ateapipb.CredentialHeader{{
+	effects := &ateapi.HttpRuleEffects{
+		ReplaceHeaders: []*ateapi.CredentialHeader{{
 			Header:        "authorization",
 			Prefix:        "Bearer ",
 			CredentialUri: "ate-secret://k8s/default/token",
 		}},
 	}
-	withEffects := &ateapipb.EgressRule{Https: &ateapipb.HTTPSRule{
+	withEffects := &ateapi.EgressRule{Https: &ateapi.HttpsRule{
 		Hostnames: []string{"api.example.com"},
 		Effects:   effects,
 	}}
 
 	tests := []struct {
 		name      string
-		policy    *ateapipb.EgressPolicy
+		policy    *ateapi.EgressPolicy
 		dest      Destination
 		decrypted bool
 		want      Decision
@@ -385,7 +413,7 @@ func TestEvaluateRequest(t *testing.T) {
 		},
 		{
 			name:   "empty rule matches nothing",
-			policy: policy(&ateapipb.EgressRule{}, httpRule("example.com")),
+			policy: policy(&ateapi.EgressRule{}, httpRule("example.com")),
 			dest:   host("example.com"),
 			want:   Decision{Allowed: true, RuleIndex: 1},
 		},
@@ -399,8 +427,8 @@ func TestEvaluateRequest(t *testing.T) {
 	}
 }
 
-func httpsRuleOnPorts(ports *ateapipb.Ports, patterns ...string) *ateapipb.EgressRule {
-	return &ateapipb.EgressRule{Https: &ateapipb.HTTPSRule{Hostnames: patterns, Ports: ports}}
+func httpsRuleOnPorts(ports *ateapi.Ports, patterns ...string) *ateapi.EgressRule {
+	return &ateapi.EgressRule{Https: &ateapi.HttpsRule{Hostnames: patterns, Ports: ports}}
 }
 
 func TestSNIRules(t *testing.T) {
@@ -420,11 +448,11 @@ func TestSNIRules(t *testing.T) {
 	}
 	tests := []struct {
 		name   string
-		policy *ateapipb.EgressPolicy
+		policy *ateapi.EgressPolicy
 		port   uint16
 		want   []SNIRule
 	}{
-		{name: "no rules", policy: &ateapipb.EgressPolicy{}, port: 443},
+		{name: "no rules", policy: &ateapi.EgressPolicy{}, port: 443},
 		{name: "http rules decide requests, not connections", policy: policy(httpRule("api.example.com")), port: 80},
 		{name: "tls_passthrough on a named port", policy: policy(passthroughRule(ports(443), "tls.example.com", "*")), port: 443, want: passthrough("tls.example.com", "*")},
 		{name: "tls_passthrough on all ports", policy: policy(passthroughRule(allPorts(), "tls.example.com")), port: 8443, want: passthrough("tls.example.com")},
@@ -495,5 +523,22 @@ func TestSNIRules(t *testing.T) {
 				t.Errorf("SNIRules(%d) = %v, want %v", tc.port, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateDNSEgressPolicy(t *testing.T) {
+	tests := []struct {
+		mode    string
+		wantErr bool
+	}{
+		{mode: DNSEgressPolicyEnforceInAtunnel, wantErr: false},
+		{mode: "", wantErr: true},
+		{mode: "unknown", wantErr: true},
+	}
+	for _, tc := range tests {
+		err := ValidateDNSEgressPolicy(tc.mode)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ValidateDNSEgressPolicy(%q) error = %v, wantErr = %v", tc.mode, err, tc.wantErr)
+		}
 	}
 }

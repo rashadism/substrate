@@ -23,8 +23,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/extproc"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/extproc"
+	"go.ate.dev/substrate/internal/resources"
 )
 
 func TestActorNotFoundErr(t *testing.T) {
@@ -128,7 +128,7 @@ func TestMapResumeError(t *testing.T) {
 		},
 		{
 			name:     "budget exhausted on capacity keeps a clean body through the wrapper",
-			err:      &budgetExhaustedError{lastErr: status.Error(codes.FailedPrecondition, "no worker has room for the actor")},
+			err:      &budgetExhaustedError{lastErr: status.Error(codes.ResourceExhausted, "no worker has room for the actor")},
 			wantCode: envoy_type.StatusCode_ServiceUnavailable,
 			wantBody: `actor team-a/ctr6 unavailable: no worker has room for the actor`,
 		},

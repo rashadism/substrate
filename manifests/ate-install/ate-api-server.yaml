@@ -22,11 +22,13 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "watch", "list"]
+# Tells a deleted node from a missing atelet, so revert and delete of an actor
+# on a node that is gone do not wait for that atelet forever.
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
 - apiGroups: ["ate.dev"]
-  resources: ["workerpools", "sandboxconfigs", "csidriverconfigs"]
-  verbs: ["get", "watch", "list"]
-- apiGroups: ["ate.dev"]
-  resources: ["workerpools"]
+  resources: ["workerpools", "csidriverconfigs"]
   verbs: ["get", "watch", "list"]
 - apiGroups: ["storage.k8s.io"]
   resources: ["storageclasses"]
@@ -83,28 +85,45 @@ spec:
       # the readinessProbe below reaching NotReady, plus propagation) +
       # --drain-timeout.
       terminationGracePeriodSeconds: 40
-      # The control snapshot plugin deletes and copies external snapshots for
-      # ate-api-server, over a Unix socket in a pod-local emptyDir. A native
+      # The control object-store plugin deletes and copies external snapshots
+      # for ate-api-server, over a Unix socket in a pod-local emptyDir. A native
       # sidecar starts before ate-api-server and stops after it. ate-api-server
       # starts only once the startup probe sees the plugin serving.
       initContainers:
-      - name: snapshot-plugin
-        image: ko://github.com/agent-substrate/substrate/cmd/snapshot-plugin
+      - name: objectstore-plugin
+        image: ko://go.ate.dev/substrate/cmd/objectstore-plugin
         restartPolicy: Always
         args:
         - control
-        - --socket=/run/snapshot-plugin/control.sock
+        - --socket=/run/objectstore-plugin/control.sock
+        # The credential exchange. On GCS, node plugins trade an actor JWT for
+        # a token scoped to that actor's snapshots. On S3 it answers
+        # UNIMPLEMENTED and the node plugins never call it. It serves over TLS
+        # on its own port with the pod's service DNS certificate, verifies
+        # JWTs with the public keys mounted below, and reaches ate-api-server
+        # over the loopback with the pod identity certificate. The issuer must
+        # be the one ate-api-server mints with, so both read it from the same
+        # ConfigMap key. On GCS it downscopes a token for the snapshot
+        # transfer service account, which it impersonates.
+        - --exchange-listen=:8445
+        - --actor-jwt-issuer=$(ATE_API_ACTOR_JWT_ISSUER)
+        - --transfer-service-account=$(ATE_API_SNAPSHOT_TRANSFER_SERVICE_ACCOUNT)
+        ports:
+        - name: exchange
+          containerPort: 8445
         # The plugin listens on a Unix socket, which a gRPC probe cannot
         # reach, and the image has no shell, so the binary checks itself.
         startupProbe:
           exec:
             command:
-            - /ko-app/snapshot-plugin
+            - /ko-app/objectstore-plugin
             - healthcheck
-            - --socket=/run/snapshot-plugin/control.sock
+            - --socket=/run/objectstore-plugin/control.sock
           periodSeconds: 2
           failureThreshold: 30
         securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
           capabilities:
             drop:
             - ALL
@@ -118,17 +137,47 @@ spec:
         # set on it.
         - name: ATE_STORAGE_BACKEND
           value: "gcs"
+        - name: ATE_API_ACTOR_JWT_ISSUER
+          valueFrom:
+            configMapKeyRef:
+              name: ate-api-server-envvars
+              key: ATE_API_ACTOR_JWT_ISSUER
+        - name: ATE_API_SNAPSHOT_TRANSFER_SERVICE_ACCOUNT
+          valueFrom:
+            configMapKeyRef:
+              name: ate-api-server-envvars
+              key: ATE_API_SNAPSHOT_TRANSFER_SERVICE_ACCOUNT
+        # The exchange verifies ate-api-server's certificate against the API
+        # Service name in this namespace.
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         envFrom:
         - configMapRef:
             name: ate-otel-config
         volumeMounts:
-        - name: snapshot-plugin
-          mountPath: /run/snapshot-plugin
+        - name: objectstore-plugin
+          mountPath: /run/objectstore-plugin
+        # For the exchange: its serving certificate, the client certificate it
+        # dials ate-api-server with, and the public keys of the actor JWT
+        # pool. Only the jwks item is projected, never the pool itself, so the
+        # sidecar cannot mint JWTs.
+        - name: "servicedns"
+          mountPath: "/run/servicedns.podcert.ate.dev"
+          readOnly: true
+        - name: "podidentity"
+          mountPath: "/run/podidentity.podcert.ate.dev"
+          readOnly: true
+        - name: "actor-id-jwt-jwks"
+          mountPath: "/run/actor-id-jwt-jwks"
+          readOnly: true
       containers:
       - name: ate-api-server
-        image: ko://github.com/agent-substrate/substrate/cmd/ateapi
+        image: ko://go.ate.dev/substrate/cmd/ateapi
         args:
           - "--grpc-server-cred-bundle=/run/servicedns.podcert.ate.dev/credential-bundle.pem"
+          - --config-file=/run/apiconfig.ate.dev/apiconfig.textproto
           - --authentication-config=/etc/ateapi/authentication/authentication.yaml
           - --postgres-read-write-connection-string=@env
           - --postgres-owner-connection-string=@env
@@ -142,14 +191,23 @@ spec:
           - --pod-identity-ca-certs=/run/podidentity.podcert.ate.dev/trust-bundle.pem
           # TODO(lior):Remove when egress API pr is merged. This turns on pluggable actor
           # egress cluster-wide. ateapi stamps this address onto every atelet
-          # Run/Restore, ateom hands it to atunnel, and actor TCP egress is
+          # Run/Restore, ateworker hands it to atunnel, and actor TCP egress is
           # transparently redirected (nftables) into atunnel, which wraps it in
           # mTLS + HTTP CONNECT to the egress gateway.
           - --default-egress-gateway-address=atenet-egress.ate-system.svc:443
           # Graceful shutdown knobs. The sum must fit within terminationGracePeriodSeconds.
           - --drain-delay=13s
           - --drain-timeout=15s
-          - --snapshot-plugin-socket=/run/snapshot-plugin/control.sock
+          - --objectstore-plugin-socket=/run/objectstore-plugin/control.sock
+          - --snapshot-location=@env
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          capabilities:
+            add:
+            - NET_BIND_SERVICE
+            drop:
+            - ALL
         env:
         - name: POD_NAME
           valueFrom:
@@ -185,8 +243,8 @@ spec:
             name: ate-api-server-secret-envvars
             optional: true
         volumeMounts:
-        - name: snapshot-plugin
-          mountPath: /run/snapshot-plugin
+        - name: objectstore-plugin
+          mountPath: /run/objectstore-plugin
         # servicedns: the apiserver's own gRPC serving cert (DNS SAN api.ate-system.svc).
         - name: "servicedns"
           mountPath: "/run/servicedns.podcert.ate.dev"
@@ -204,6 +262,9 @@ spec:
         - name: "actor-id-ca-pool"
           mountPath: "/run/actor-id-ca-pool"
           readOnly: true
+        - name: "api-config"
+          mountPath: "/run/apiconfig.ate.dev"
+          readOnly: true
         - name: "authentication-config"
           mountPath: "/etc/ateapi/authentication"
           readOnly: true
@@ -220,14 +281,16 @@ spec:
         - containerPort: 443
         - name: prometheus
           containerPort: 9090
+        - name: health
+          containerPort: 9091
         readinessProbe:
           httpGet:
             path: /readyz
-            port: 9090
+            port: health
           initialDelaySeconds: 5
           periodSeconds: 2
           failureThreshold: 3
-        # :9090 is bound near the end of boot, after the store connect and
+        # :9091 is bound near the end of boot, after the store connect and
         # the schema migrations, so nothing answers here until both finish.
         # The store connect alone budgets 60s (30 attempts, 2s apart) and the
         # migrations serialize across replicas on an advisory lock. Without a
@@ -239,20 +302,22 @@ spec:
         startupProbe:
           httpGet:
             path: /healthz
-            port: 9090
+            port: health
           periodSeconds: 5
           failureThreshold: 24
         # /healthz stays 200 while a terminating pod drains; /readyz
         # turns 503, so liveness and readiness diverge correctly during
-        # shutdown.
+        # shutdown. /readyz also turns 503 while the store is unreachable,
+        # pinged over its own connection so a busy request pool cannot fail
+        # it, and /healthz stays 200: the pool reconnects without a restart.
         livenessProbe:
           httpGet:
             path: /healthz
-            port: 9090
+            port: health
           initialDelaySeconds: 10
           periodSeconds: 10
       volumes:
-      - name: snapshot-plugin
+      - name: objectstore-plugin
         emptyDir: {}
       - name: "servicedns"
         projected:
@@ -303,6 +368,17 @@ spec:
               items:
               - key: "pool"
                 path: "pool.json"
+      # The same Secret's public keys alone, for the objectstore-plugin
+      # sidecar's JWT verification. ate-setup and kubectl ate admin keep the
+      # jwks key in step with pool.
+      - name: "actor-id-jwt-jwks"
+        projected:
+          sources:
+          - secret:
+              name: "actor-id-jwt-pool"
+              items:
+              - key: "jwks"
+                path: "jwks.json"
       - name: "actor-id-ca-pool"
         projected:
           sources:
@@ -311,6 +387,9 @@ spec:
               items:
               - key: "pool"
                 path: "pool.json"
+      - name: "api-config"
+        configMap:
+          name: "ate-api-config"
       - name: "authentication-config"
         configMap:
           name: "ate-api-authentication"
@@ -351,3 +430,9 @@ spec:
     protocol: TCP
     port: 443
     targetPort: 443
+  # The objectstore-plugin sidecar's credential exchange, called by the node
+  # plugins beside atelet.
+  - name: exchange
+    protocol: TCP
+    port: 8445
+    targetPort: 8445

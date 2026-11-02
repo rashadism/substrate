@@ -30,14 +30,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/authz"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/defaults"
-	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.ate.dev/substrate/api/ateapi/v1"
+	"go.ate.dev/substrate/cmd/ateapi/internal/authz"
+	"go.ate.dev/substrate/cmd/ateapi/internal/defaults"
+	"go.ate.dev/substrate/cmd/ateapi/internal/store"
+	"go.ate.dev/substrate/internal/resources"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -52,16 +54,24 @@ const (
 	// Migrations need one connection for Goose's session lock and one for
 	// migration work. Outbox maintenance is serial after startup.
 	ownerPoolMaxConns = 2
+	// The readiness probe pings over one connection that nothing else
+	// borrows. With no minimum it dials on the first probe.
+	probePoolMaxConns = 1
+	probePoolMinConns = 0
 )
 
 type Persistence struct {
 	pool *pgxpool.Pool
 	// watchPool serves WatchWorkers pollers and expired-lease cleanup.
 	// ownerPool applies migrations and maintains outbox partitions.
+	// probePool serves only Ping, so request traffic can never hold the
+	// connection a readiness probe needs.
 	watchPool             *pgxpool.Pool
 	ownerPool             *pgxpool.Pool
+	probePool             *pgxpool.Pool
 	ownsWatchPool         bool
 	ownsOwnerPool         bool
+	ownsProbePool         bool
 	policyManager         *authz.PolicyManager
 	leaseTTL              time.Duration
 	pollFailureCloseAfter time.Duration
@@ -103,7 +113,7 @@ func (p *Persistence) publishLocally(ctx context.Context, payload []byte) {
 	}
 	for ch := range p.watchers {
 		select {
-		case ch <- store.WorkerEvent{Type: event.Type, Worker: proto.Clone(event.Worker).(*ateapipb.Worker)}:
+		case ch <- store.WorkerEvent{Type: event.Type, Worker: proto.Clone(event.Worker).(*ateapi.Worker)}:
 		default:
 		}
 	}
@@ -125,7 +135,8 @@ type ConnectConfig struct {
 	PoolMaxConns  int32
 }
 
-// Connect opens read/write and owner pools. It creates the schema and applies migrations.
+// Connect opens the read/write, owner, watch, and probe pools. It creates the
+// schema and applies migrations.
 func Connect(ctx context.Context, config ConnectConfig) (*Persistence, error) {
 	if config.Schema == "" {
 		return nil, fmt.Errorf("PostgreSQL schema must not be empty")
@@ -184,18 +195,23 @@ func Connect(ctx context.Context, config ConnectConfig) (*Persistence, error) {
 		return nil, err
 	}
 
-	watchCfg := readWriteConfig.Copy()
-	watchCfg.MaxConns = watchPoolMaxConns
-	watchCfg.MinConns = watchPoolMinConns
-	watchPool, err := pgxpool.NewWithConfig(ctx, watchCfg)
+	watchPool, err := pgxpool.NewWithConfig(ctx, resizedPoolConfig(readWriteConfig, watchPoolMaxConns, watchPoolMinConns))
 	if err != nil {
 		ownerPool.Close()
 		pool.Close()
 		return nil, fmt.Errorf("opening PostgreSQL watch pool: %w", err)
 	}
-
-	p, err := newPersistence(ctx, pool, watchPool, ownerPool)
+	probePool, err := pgxpool.NewWithConfig(ctx, resizedPoolConfig(readWriteConfig, probePoolMaxConns, probePoolMinConns))
 	if err != nil {
+		watchPool.Close()
+		ownerPool.Close()
+		pool.Close()
+		return nil, fmt.Errorf("opening PostgreSQL probe pool: %w", err)
+	}
+
+	p, err := newPersistence(ctx, pool, watchPool, ownerPool, probePool)
+	if err != nil {
+		probePool.Close()
 		watchPool.Close()
 		ownerPool.Close()
 		pool.Close()
@@ -203,7 +219,18 @@ func Connect(ctx context.Context, config ConnectConfig) (*Persistence, error) {
 	}
 	p.ownsWatchPool = true
 	p.ownsOwnerPool = true
+	p.ownsProbePool = true
 	return p, nil
+}
+
+// resizedPoolConfig returns a copy of base, the read/write pool config, with
+// its own connection limits, so a dedicated pool gets the same role, search
+// path, and TLS handling as the main one.
+func resizedPoolConfig(base *pgxpool.Config, maxConns, minConns int32) *pgxpool.Config {
+	cfg := base.Copy()
+	cfg.MaxConns = maxConns
+	cfg.MinConns = minConns
+	return cfg
 }
 
 func createSchema(ctx context.Context, pool *pgxpool.Pool, schema string) error {
@@ -247,6 +274,9 @@ func poolConfig(dsn, role string) (*pgxpool.Config, error) {
 		}
 		return nil
 	}
+	// Per-statement trace spans; the watch and probe pools inherit this through
+	// resizedPoolConfig.
+	cfg.ConnConfig.Tracer = newQueryTracer(otel.GetTracerProvider(), cfg.ConnConfig)
 	usesTLS := cfg.ConnConfig.TLSConfig != nil
 	for _, fallback := range cfg.ConnConfig.Fallbacks {
 		usesTLS = usesTLS || fallback.TLSConfig != nil
@@ -268,12 +298,13 @@ func poolConfig(dsn, role string) (*pgxpool.Config, error) {
 
 // NewPersistence wraps an already-open pool, applying pending migrations.
 // Callers that already hold a pool (e.g. tests using testcontainers) use
-// this directly instead of Connect; outbox watch traffic shares the given pool.
+// this directly instead of Connect; outbox watch traffic and Ping share the
+// given pool.
 func NewPersistence(ctx context.Context, pool *pgxpool.Pool) (*Persistence, error) {
-	return newPersistence(ctx, pool, pool, pool)
+	return newPersistence(ctx, pool, pool, pool, pool)
 }
 
-func newPersistence(ctx context.Context, pool, watchPool, ownerPool *pgxpool.Pool) (*Persistence, error) {
+func newPersistence(ctx context.Context, pool, watchPool, ownerPool, probePool *pgxpool.Pool) (*Persistence, error) {
 	if err := applyMigrations(ctx, ownerPool); err != nil {
 		return nil, err
 	}
@@ -282,6 +313,7 @@ func newPersistence(ctx context.Context, pool, watchPool, ownerPool *pgxpool.Poo
 		pool:                  pool,
 		watchPool:             watchPool,
 		ownerPool:             ownerPool,
+		probePool:             probePool,
 		leaseTTL:              defaultLeaseTTL,
 		pollFailureCloseAfter: outboxPollFailureCloseAfter,
 		stopMaintenance:       stopMaintenance,
@@ -319,6 +351,16 @@ func (p *Persistence) Close() {
 	if p.ownsOwnerPool {
 		p.ownerPool.Close()
 	}
+	if p.ownsProbePool {
+		p.probePool.Close()
+	}
+}
+
+// Ping reports whether PostgreSQL answers. It uses a connection reserved for
+// it, so a saturated request pool cannot make it fail: it fails only when the
+// database does not answer within ctx.
+func (p *Persistence) Ping(ctx context.Context) error {
+	return p.probePool.Ping(ctx)
 }
 
 // Pool returns the underlying PostgreSQL connection pool.
@@ -363,16 +405,17 @@ func unmarshalRow(b []byte, m proto.Message, kind string, id ...string) error {
 	return nil
 }
 
-func setCreateMetadata(metadata *ateapipb.ResourceMetadata) {
+func setCreateMetadata(metadata *ateapi.ResourceMetadata) {
 	metadata.Uid = uuid.NewString()
 	metadata.Version = 1
 	metadata.CreateTime = timestamppb.Now()
 	metadata.UpdateTime = metadata.CreateTime
+	metadata.DeleteTime = nil
 }
 
 // validateProtoMetadataMatchesColumns verifies that the metadata in the database
 // matches the metadata in the proto.
-func validateProtoMetadataMatchesColumns(resource string, metadata *ateapipb.ResourceMetadata, uid string, version int64) error {
+func validateProtoMetadataMatchesColumns(resource string, metadata *ateapi.ResourceMetadata, uid string, version int64) error {
 	if metadata.GetUid() != uid {
 		return fmt.Errorf("%s uid projection %q does not match proto metadata uid %q", resource, uid, metadata.GetUid())
 	}
@@ -382,11 +425,26 @@ func validateProtoMetadataMatchesColumns(resource string, metadata *ateapipb.Res
 	return nil
 }
 
-func setUpdateMetadata(newMeta, oldMeta *ateapipb.ResourceMetadata) {
+// validateSnapshotURIs requires the URI of every durable snapshot to parse, so
+// readers can rely on resources.ParseSnapshotURI.
+func validateSnapshotURIs(resource string, snapshots ...*ateapi.Snapshot) error {
+	for _, snap := range snapshots {
+		if snap.GetDurableSnapshot() == nil {
+			continue
+		}
+		if _, err := resources.ParseSnapshotURI(snap.GetDurableSnapshot().GetObject().GetSnapshotUri()); err != nil {
+			return fmt.Errorf("%s snapshot %s: %w", resource, snap.GetUuid(), err)
+		}
+	}
+	return nil
+}
+
+func setUpdateMetadata(newMeta, oldMeta *ateapi.ResourceMetadata) {
 	newMeta.Uid = oldMeta.Uid
 	newMeta.Version = oldMeta.Version + 1
 	newMeta.CreateTime = oldMeta.CreateTime
 	newMeta.UpdateTime = timestamppb.Now()
+	newMeta.DeleteTime = oldMeta.DeleteTime
 }
 
 func mapDeleteError(err error, uid string, version int64, precondition store.DeletePreconditions) error {
@@ -396,7 +454,7 @@ func mapDeleteError(err error, uid string, version int64, precondition store.Del
 	if err != nil {
 		return fmt.Errorf("reading after a guarded delete matched nothing: %w", err)
 	}
-	if err := precondition.Check(&ateapipb.ResourceMetadata{Uid: uid, Version: version}); err != nil {
+	if err := precondition.Check(&ateapi.ResourceMetadata{Uid: uid, Version: version}); err != nil {
 		return err
 	}
 	// The row matches the guards now, so it changed between the two statements.

@@ -24,7 +24,8 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/agent-substrate/substrate/cmd/atenet/internal/router/ingress"
+	"go.ate.dev/substrate/cmd/atenet/internal/router/ingress"
+	"go.ate.dev/substrate/internal/credbundle"
 )
 
 type dataplaneHealthCheck struct {
@@ -39,8 +40,9 @@ type dataplaneHealthCheck struct {
 func (r atenetRouter) healthCheck() dataplaneHealthCheck {
 	switch r {
 	case atenetRouterEnvoy:
-		// localhost, not 127.0.0.1: the admin socket binds `::`, so the dial
-		// has to be able to fall through to the IPv6 loopback.
+		// Use `localhost` because we must try both IPv6 and IPv4.
+		//
+		// TODO: Shouldn't this work for the agentgateway case as well?
 		return dataplaneHealthCheck{url: "http://localhost:9901/ready", expectedBody: "LIVE"}
 	case atenetRouterAgentgateway:
 		return dataplaneHealthCheck{url: "http://127.0.0.1:15021/healthz/ready", expectedBody: "ready"}
@@ -62,28 +64,9 @@ func (s *RouterServer) startDataplane(ctx context.Context, g *errgroup.Group, pa
 }
 
 func (s *RouterServer) startEnvoyDataplane(ctx context.Context, g *errgroup.Group, parkCfg ingress.ParkedRequestConfig, traceRootSamplingPercent float64) error {
-	xdsSrv := NewXdsServer(s.cfg.XdsPort)
-	xdsSrv.SetConfig(s.cfg.HttpPort, s.cfg.ExtprocPort, s.cfg.ExtprocAddr)
-	xdsSrv.SetConnectPorts(s.cfg.ConnectPlainTextPort, s.cfg.ConnectTLSPort)
-	setOtlpCollector(ctx, xdsSrv, s.cfg.OtlpCollectorAddress)
-	xdsSrv.SetTraceRootSamplingPercent(traceRootSamplingPercent)
-
-	xdsSrv.SetRouteTimeout(s.cfg.RouteTimeout)
-	xdsSrv.SetExtProcMaxRequests(s.cfg.extProcMaxRequests())
-	if parkCfg.Enabled() {
-		// Envoy must keep a parked request open at least as long as the router
-		// will hold it; add a margin so the router surfaces its own 503 first.
-		xdsSrv.SetExtProcMessageTimeout(parkCfg.Budget + 5*time.Second)
-	}
-
-	xdsSrv.SetTlsConfig(s.cfg.HttpsPort, s.cfg.EnvoyCertPath)
-	xdsSrv.SetUpstreamTls(s.cfg.UpstreamCredentialBundlePath, s.cfg.UpstreamTrustBundlePath, s.cfg.UpstreamSpiffePrefix)
-
-	// The snapshot is a pure function of the configuration applied above, so it
-	// is built exactly once; an Envoy that connects later is served from the
-	// xDS cache.
-	if err := xdsSrv.UpdateSnapshot(); err != nil {
-		return fmt.Errorf("building the xDS snapshot: %w", err)
+	xdsSrv, err := s.newEnvoyXdsServer(ctx, parkCfg, traceRootSamplingPercent)
+	if err != nil {
+		return err
 	}
 
 	// Envoy receives all routing configuration from the local xDS server.
@@ -99,6 +82,50 @@ func (s *RouterServer) startEnvoyDataplane(ctx context.Context, g *errgroup.Grou
 		return xdsSrv.Serve(ctx, lis)
 	})
 	return nil
+}
+
+// newEnvoyXdsServer applies the router configuration to a new xDS server and
+// builds its snapshot.
+func (s *RouterServer) newEnvoyXdsServer(ctx context.Context, parkCfg ingress.ParkedRequestConfig, traceRootSamplingPercent float64) (*XdsServer, error) {
+	xdsSrv := NewXdsServer(s.cfg.XdsPort)
+	xdsSrv.SetConfig(s.cfg.ExtprocPort, s.cfg.ExtprocAddr)
+	xdsSrv.SetConnectTLSPort(s.cfg.ConnectTLSPort)
+	setOtlpCollector(ctx, xdsSrv, s.cfg.OtlpCollectorAddress)
+	xdsSrv.SetTraceRootSamplingPercent(traceRootSamplingPercent)
+
+	xdsSrv.SetRouteTimeout(s.cfg.RouteTimeout)
+	xdsSrv.SetExtProcMaxRequests(s.cfg.extProcMaxRequests())
+	if parkCfg.Enabled() {
+		// Envoy must keep a parked request open at least as long as the router
+		// will hold it; add a margin so the router surfaces its own 503 first.
+		xdsSrv.SetExtProcMessageTimeout(parkCfg.Budget + 5*time.Second)
+	}
+
+	xdsSrv.SetTlsConfig(s.cfg.HttpsPort, s.cfg.EnvoyCertPath)
+	// Envoy is what reads the bundle, but it would only surface a bad one as
+	// a listener that never warms. Parse it here so the router fails startup
+	// instead.
+	if _, err := credbundle.ParsePool(s.cfg.IngressAuth.ClientCAFile); err != nil {
+		return nil, fmt.Errorf("loading --ingress-client-ca-file: %w", err)
+	}
+	xdsSrv.SetDownstreamClientAuth(s.cfg.IngressAuth.ClientCAFile, s.cfg.IngressAuth.AllowedSPIFFEIDs)
+	if len(s.cfg.IngressAuth.AllowedSPIFFEIDs) == 0 {
+		slog.InfoContext(ctx, "No --ingress-allowed-spiffe-ids, so the router serves no traffic")
+	} else {
+		slog.InfoContext(ctx, "TLS ingress listeners require client certificates",
+			slog.String("client_ca_file", s.cfg.IngressAuth.ClientCAFile),
+			slog.Any("allowed_spiffe_ids", s.cfg.IngressAuth.AllowedSPIFFEIDs))
+	}
+	xdsSrv.SetUpstreamTls(s.cfg.UpstreamCredentialBundlePath, s.cfg.UpstreamTrustBundlePath)
+	xdsSrv.SetUpstreamConnect(s.cfg.UpstreamConnect)
+
+	// The snapshot is a pure function of the configuration applied above, so it
+	// is built exactly once; an Envoy that connects later is served from the
+	// xDS cache.
+	if err := xdsSrv.UpdateSnapshot(); err != nil {
+		return nil, fmt.Errorf("building the xDS snapshot: %w", err)
+	}
+	return xdsSrv, nil
 }
 
 // xdsListenAddress is where the router serves xDS to the Envoy in its own pod.

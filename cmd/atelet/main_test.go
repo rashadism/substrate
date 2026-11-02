@@ -29,33 +29,33 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/cmd/atelet/internal/ateletpath"
-	"github.com/agent-substrate/substrate/internal/apierror"
-	"github.com/agent-substrate/substrate/internal/ateattr"
-	"github.com/agent-substrate/substrate/internal/atelet"
-	"github.com/agent-substrate/substrate/internal/imagecache"
-	"github.com/agent-substrate/substrate/internal/nodepath"
-	"github.com/agent-substrate/substrate/internal/ocispec"
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/internal/proto/ateompb"
-	"github.com/agent-substrate/substrate/internal/resources"
-	"github.com/agent-substrate/substrate/internal/serverboot"
-	"github.com/agent-substrate/substrate/pkg/objectstorage"
 	"github.com/google/go-cmp/cmp"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/spf13/pflag"
-	"golang.org/x/sys/unix"
+	"go.ate.dev/substrate/cmd/atelet/internal/actordirs"
+	"go.ate.dev/substrate/cmd/atelet/internal/ateletpath"
+	"go.ate.dev/substrate/cmd/atelet/internal/snapshottracker"
+	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateinterceptors"
+	"go.ate.dev/substrate/internal/atelet"
+	"go.ate.dev/substrate/internal/imagecache"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
+	"go.ate.dev/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/serverboot"
+	"go.ate.dev/substrate/pkg/objectstorage"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
-
-const testPauseImage = "registry.k8s.io/pause:3.10.2@sha256:f548e0e8e3dc1896ca956272154dde3314e8cc4fde0a57577ee9fa1c63f5baf4"
 
 const (
 	snapshotOwnerUID = "3d7f1b62-8a04-4c19-b5e6-2f9c7a1d0e38"
@@ -79,92 +79,119 @@ func TestPortFlagDefault(t *testing.T) {
 	}
 }
 
-// TestCopyLocalCheckpointLinks covers staging a local checkpoint into the restore
-// dir: the files must land as extra links to the cached snapshot rather than
-// copies, so a resume does not rewrite the image's working set. Sharing the inode
-// is what MergeDeltaIntoBase's Nlink check keys off to refuse its in-place overlay.
-func TestCopyLocalCheckpointLinks(t *testing.T) {
-	const snapshot = "snap-1"
-	want := []byte("checkpoint pages")
-
-	newDirs := func(t *testing.T) (srcDir, dstDir string) {
-		t.Helper()
-		root := t.TempDir()
-		srcDir, dstDir = filepath.Join(root, "local-checkpoint"), filepath.Join(root, "restore-state")
-		if err := os.MkdirAll(filepath.Join(srcDir, snapshot), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.MkdirAll(dstDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(srcDir, snapshot, "memory-ranges"), want, 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return srcDir, dstDir
+// The snapshot delay flags must be positive, the upload timeout must not be
+// negative (0 turns it off), and the upload delay must not exceed the detach
+// delay, which the defaults satisfy too.
+func TestValidateSnapshotDelayFlags(t *testing.T) {
+	setFlags := func(upload, detach, timeout, giveUp time.Duration) {
+		*snapshotUploadDelay, *snapshotDetachDelay, *snapshotUploadTimeout, *snapshotReportGiveUpAfter = upload, detach, timeout, giveUp
 	}
-	inode := func(t *testing.T, path string) uint64 {
-		t.Helper()
-		fi, err := os.Stat(path)
-		if err != nil {
-			t.Fatal(err)
+	t.Cleanup(func() {
+		setFlags(snapshottracker.DefaultUploadDelay, snapshottracker.DefaultDetachDelay, snapshottracker.DefaultUploadTimeout, snapshottracker.DefaultReportGiveUpAfter)
+	})
+
+	for _, tc := range []struct {
+		name                            string
+		upload, detach, timeout, giveUp time.Duration
+		wantErr                         bool
+	}{
+		{"defaults", snapshottracker.DefaultUploadDelay, snapshottracker.DefaultDetachDelay, snapshottracker.DefaultUploadTimeout, snapshottracker.DefaultReportGiveUpAfter, false},
+		{"upload sooner than detach", time.Minute, time.Hour, 5 * time.Minute, time.Minute, false},
+		{"upload as late as detach", time.Hour, time.Hour, 5 * time.Minute, time.Minute, false},
+		{"upload later than detach", time.Hour, time.Minute, 5 * time.Minute, time.Minute, true},
+		{"zero upload delay", 0, time.Hour, 5 * time.Minute, time.Minute, true},
+		{"negative detach delay", time.Minute, -time.Minute, 5 * time.Minute, time.Minute, true},
+		{"zero upload timeout", time.Minute, time.Hour, 0, time.Minute, false},
+		{"negative upload timeout", time.Minute, time.Hour, -time.Minute, time.Minute, true},
+		{"zero report give-up delay", time.Minute, time.Hour, 5 * time.Minute, 0, true},
+		{"negative report give-up delay", time.Minute, time.Hour, 5 * time.Minute, -time.Minute, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setFlags(tc.upload, tc.detach, tc.timeout, tc.giveUp)
+			if err := validateSnapshotDelayFlags(); (err != nil) != tc.wantErr {
+				t.Errorf("upload=%v detach=%v timeout=%v giveUp=%v: err = %v, wantErr %v", tc.upload, tc.detach, tc.timeout, tc.giveUp, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// --snapshot-upload-est-throughput-mib must be between 0, which adds no time
+// for a snapshot's size, and maxSnapshotUploadEstMiBps, so its rate in bytes
+// cannot overflow, and defaults to the tracker's default throughput in MiB/s.
+func TestValidateSnapshotUploadEstThroughput(t *testing.T) {
+	t.Cleanup(func() { *snapshotUploadEstMiBps = snapshottracker.DefaultUploadEstThroughput >> 20 })
+	for _, tc := range []struct {
+		mibps   int
+		wantErr bool
+	}{
+		{snapshottracker.DefaultUploadEstThroughput >> 20, false},
+		{1, false},
+		{0, false},
+		{maxSnapshotUploadEstMiBps, false},
+		{maxSnapshotUploadEstMiBps + 1, true},
+		{-1, true},
+	} {
+		*snapshotUploadEstMiBps = tc.mibps
+		if err := validateSnapshotDelayFlags(); (err != nil) != tc.wantErr {
+			t.Errorf("--snapshot-upload-est-throughput-mib=%d: err = %v, wantErr %v", tc.mibps, err, tc.wantErr)
 		}
-		return fi.Sys().(*syscall.Stat_t).Ino
 	}
 
-	t.Run("links when it can", func(t *testing.T) {
-		srcDir, dstDir := newDirs(t)
-		s := &AteomHerder{}
-		if err := s.copyLocalCheckpoint(context.Background(), filepath.Dir(srcDir), snapshot, srcDir, dstDir, []string{"memory-ranges"}); err != nil {
-			t.Fatalf("copyLocalCheckpoint: %v", err)
-		}
-		src := filepath.Join(srcDir, snapshot, "memory-ranges")
-		dst := filepath.Join(dstDir, "memory-ranges")
-		if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("dst content = %q (err %v), want %q", got, err, want)
-		}
-		if inode(t, src) != inode(t, dst) {
-			t.Error("staged file is a copy; expected a link to the cached snapshot")
-		}
+	f := pflag.Lookup("snapshot-upload-est-throughput-mib")
+	if f == nil {
+		t.Fatal("no --snapshot-upload-est-throughput-mib flag registered")
+	}
+	if want := "100"; f.DefValue != want {
+		t.Errorf("--snapshot-upload-est-throughput-mib default = %q, want %q", f.DefValue, want)
+	}
+}
+
+// Upload, detach, and report worker flags must be at least 1, and each flag
+// defaults to the tracker's default count.
+func TestValidateSnapshotWorkerFlags(t *testing.T) {
+	setFlags := func(upload, detach, report int) {
+		*snapshotUploadWorkers, *snapshotDetachWorkers, *snapshotReportWorkers = upload, detach, report
+	}
+	t.Cleanup(func() {
+		setFlags(snapshottracker.DefaultUploadWorkers, snapshottracker.DefaultDetachWorkers, snapshottracker.DefaultReportWorkers)
 	})
 
-	t.Run("falls back to copying across filesystems", func(t *testing.T) {
-		srcDir, dstDir := newDirs(t)
-		// EXDEV stands in for the mount boundary a unit test cannot produce.
-		orig := linkFile
-		linkFile = func(*os.Root, string, string) error { return unix.EXDEV }
-		t.Cleanup(func() { linkFile = orig })
+	for _, tc := range []struct {
+		name                   string
+		upload, detach, report int
+		wantErr                bool
+	}{
+		{"defaults", snapshottracker.DefaultUploadWorkers, snapshottracker.DefaultDetachWorkers, snapshottracker.DefaultReportWorkers, false},
+		{"single worker each", 1, 1, 1, false},
+		{"zero upload workers", 0, 2, 1, true},
+		{"negative upload workers", -1, 2, 1, true},
+		{"zero detach workers", 2, 0, 1, true},
+		{"negative detach workers", 2, -1, 1, true},
+		{"zero report workers", 2, 2, 0, true},
+		{"negative report workers", 2, 2, -1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setFlags(tc.upload, tc.detach, tc.report)
+			if err := validateSnapshotWorkerFlags(); (err != nil) != tc.wantErr {
+				t.Errorf("upload=%d detach=%d report=%d: err = %v, wantErr %v", tc.upload, tc.detach, tc.report, err, tc.wantErr)
+			}
+		})
+	}
 
-		s := &AteomHerder{}
-		if err := s.copyLocalCheckpoint(context.Background(), filepath.Dir(srcDir), snapshot, srcDir, dstDir, []string{"memory-ranges"}); err != nil {
-			t.Fatalf("copyLocalCheckpoint: %v", err)
+	for name, want := range map[string]int{
+		"snapshot-upload-workers": snapshottracker.DefaultUploadWorkers,
+		"snapshot-detach-workers": snapshottracker.DefaultDetachWorkers,
+		"snapshot-report-workers": snapshottracker.DefaultReportWorkers,
+	} {
+		f := pflag.Lookup(name)
+		if f == nil {
+			t.Errorf("no --%s flag registered", name)
+			continue
 		}
-		dst := filepath.Join(dstDir, "memory-ranges")
-		if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("dst content = %q (err %v), want %q", got, err, want)
+		if f.DefValue != strconv.Itoa(want) {
+			t.Errorf("--%s default = %q, want %d", name, f.DefValue, want)
 		}
-		if inode(t, filepath.Join(srcDir, snapshot, "memory-ranges")) == inode(t, dst) {
-			t.Error("expected a copy on the fallback path, got a link")
-		}
-	})
-
-	// Only EXDEV may fall back. Copying on any other link failure would silently
-	// undo this optimization, and would hand sparsefile.CopyFile a dst that may already be a
-	// link to src, where its O_TRUNC empties both before the copy reads a byte.
-	t.Run("other link failures are fatal", func(t *testing.T) {
-		srcDir, dstDir := newDirs(t)
-		dst := filepath.Join(dstDir, "memory-ranges")
-		if err := os.Link(filepath.Join(srcDir, snapshot, "memory-ranges"), dst); err != nil {
-			t.Fatal(err)
-		}
-		s := &AteomHerder{}
-		// dst already exists, so os.Link fails with EEXIST.
-		if err := s.copyLocalCheckpoint(context.Background(), filepath.Dir(srcDir), snapshot, srcDir, dstDir, []string{"memory-ranges"}); err == nil {
-			t.Fatal("copyLocalCheckpoint accepted a non-EXDEV link failure, want an error")
-		}
-		if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("dst content = %q (err %v), want the untouched %q", got, err, want)
-		}
-	})
+	}
 }
 
 func TestSnapshotManifestActorMetadata(t *testing.T) {
@@ -191,7 +218,7 @@ func TestSnapshotManifestActorMetadata(t *testing.T) {
 // Run/Restore, which has no fidelity, parses back with an empty fidelity and
 // does not serialize a fidelity key at all.
 func TestSnapshotManifestFidelityAbsent(t *testing.T) {
-	legacy := []byte(`{"sandboxClass":"gvisor","pauseImage":"` + testPauseImage + `","snapshotFiles":["checkpoint.img"]}`)
+	legacy := []byte(`{"sandboxClass":"gvisor","snapshotFiles":["checkpoint.img"]}`)
 	rec, err := unmarshalSandboxRecord(legacy)
 	if err != nil {
 		t.Fatalf("unmarshalSandboxRecord(legacy manifest): %v", err)
@@ -209,70 +236,6 @@ func TestSnapshotManifestFidelityAbsent(t *testing.T) {
 	}
 }
 
-// TestSnapshotManifestPauseImage pins that only a gVisor manifest needs a
-// pause image: micro-VM sandboxes run no pause container.
-func TestSnapshotManifestPauseImage(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		manifest string
-		wantErr  bool
-	}{
-		{"gvisor without pause image", `{"sandboxClass":"gvisor","snapshotFiles":["checkpoint.img"]}`, true},
-		{"gvisor with pause image", `{"sandboxClass":"gvisor","pauseImage":"` + testPauseImage + `","snapshotFiles":["checkpoint.img"]}`, false},
-		{"microvm without pause image", `{"sandboxClass":"microvm","snapshotFiles":["checkpoint.img"]}`, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := unmarshalSandboxRecord([]byte(tc.manifest))
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("unmarshalSandboxRecord succeeded, want an error")
-				}
-				if !strings.Contains(err.Error(), "pauseImage") {
-					t.Errorf("error = %v, want it to name pauseImage", err)
-				}
-			} else if err != nil {
-				t.Fatalf("unmarshalSandboxRecord: %v", err)
-			}
-		})
-	}
-}
-
-// TestPrepareOCIBundlesPause pins that the pause bundle is built only when the
-// sandbox has a pause image.
-func TestPrepareOCIBundlesPause(t *testing.T) {
-	host := imageVolumeTestRegistry(t)
-	image := host + "/actor:v1"
-	pushTestImage(t, image, singleFileLayer(t, "bin/app", "app"))
-	spec := &ateletpb.WorkloadSpec{
-		Containers: []*ateletpb.Container{{Name: "app", Image: image, Command: []string{"/bin/app"}}},
-	}
-
-	for _, tc := range []struct {
-		name       string
-		pauseImage string
-		wantPause  bool
-	}{
-		{"with pause image", image, true},
-		{"without pause image", "", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			useTempNodeDirs(t)
-			const actorUID = "actor-uid-1"
-			s := &AteomHerder{imageCache: newImageVolumeStore(t)}
-			if _, err := s.prepareOCIBundles(t.Context(), actorUID, resources.ActorRef{}, spec, tc.pauseImage); err != nil {
-				t.Fatalf("prepareOCIBundles: %v", err)
-			}
-			if _, err := os.Stat(filepath.Join(ateletpath.OCIBundlePath(actorUID, "app"), imagecache.OverlaySpecFileName)); err != nil {
-				t.Errorf("app bundle: %v", err)
-			}
-			_, err := os.Stat(ateletpath.OCIBundlePath(actorUID, ocispec.PauseContainer))
-			if gotPause := err == nil; gotPause != tc.wantPause {
-				t.Errorf("pause bundle exists = %v, want %v (stat: %v)", gotPause, tc.wantPause, err)
-			}
-		})
-	}
-}
-
 // TestPrepareOCIBundlesFillsContainerSpec pins that each container's spec
 // carries its resolved args, env, capabilities and resource limits.
 func TestPrepareOCIBundlesFillsContainerSpec(t *testing.T) {
@@ -286,34 +249,90 @@ func TestPrepareOCIBundlesFillsContainerSpec(t *testing.T) {
 			Image:   image,
 			Command: []string{"/bin/app"},
 			Args:    []string{"serve"},
-			Env:     []*ateletpb.EnvEntry{{Name: "GREETING", Value: "hello"}},
+			Env:     []*ateletpb.EnvVar{{Name: "GREETING", Value: "hello"}},
 			SecurityContext: &ateletpb.SecurityContext{
 				Capabilities: &ateletpb.Capabilities{Add: []string{"NET_ADMIN"}, Drop: []string{"KILL"}},
 			},
-			Resources: &ateletpb.ResourceLimits{MemoryBytes: 1 << 30, CpuMillis: 500},
+			Resources: &ateletpb.ResourceRequirements{Limits: &ateletpb.Resources{MemoryBytes: 1 << 30, CpuMillicores: 500}},
 		}},
 	}
 
-	s := &AteomHerder{imageCache: newImageVolumeStore(t)}
-	got, err := s.prepareOCIBundles(t.Context(), "actor-uid-1", resources.ActorRef{}, spec, "")
+	s := &Atelet{imageCache: newImageVolumeStore(t)}
+	got, err := s.prepareOCIBundles(t.Context(), "actor-uid-1", resources.ActorRef{}, spec)
 	if err != nil {
 		t.Fatalf("prepareOCIBundles: %v", err)
 	}
-	want := []*ateompb.ContainerSpec{{
+	want := []*ateworkerpb.ContainerSpec{{
 		Args:         []string{"/bin/app", "serve"},
 		Env:          []string{"GREETING=hello", "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 		Capabilities: []string{"CAP_AUDIT_WRITE", "CAP_NET_ADMIN", "CAP_NET_BIND_SERVICE"},
-		Resources:    &ateompb.ResourceLimits{MemoryBytes: 1 << 30, CpuMillis: 500},
+		Resources:    &ateworkerpb.ResourceRequirements{Limits: &ateworkerpb.Resources{MemoryBytes: 1 << 30, CpuMillicores: 500}},
+		Cwd:          "/",
 	}}
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
 		t.Errorf("prepareOCIBundles container specs mismatch (-want +got):\n%s", diff)
 	}
 }
 
+// TestPrepareOCIBundlesResolvesUsers pins that a container runs as its image's
+// USER, resolved against the image's own passwd and group files; a USER the
+// image cannot resolve fails the run.
+func TestPrepareOCIBundlesResolvesUsers(t *testing.T) {
+	useTempNodeDirs(t)
+	host := imageVolumeTestRegistry(t)
+	etc := []v1.Layer{
+		singleFileLayer(t, "etc/passwd", "root:x:0:0:root:/root:/bin/sh\nnonroot:x:65532:65532::/home/nonroot:/sbin/nologin\n"),
+		singleFileLayer(t, "etc/group", "root:x:0:\nnonroot:x:65532:\nvideo:x:44:nonroot\n"),
+	}
+	app := pushTestImageWithConfig(t, host+"/app:v1", v1.Config{User: "nonroot", Cmd: []string{"/bin/app"}}, etc...)
+	s := &Atelet{imageCache: newImageVolumeStore(t)}
+
+	spec := &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "app", Image: app}}}
+	got, err := s.prepareOCIBundles(t.Context(), "actor-uid-1", resources.ActorRef{}, spec)
+	if err != nil {
+		t.Fatalf("prepareOCIBundles: %v", err)
+	}
+	want := &ateworkerpb.ProcessUser{Uid: 65532, Gid: 65532, AdditionalGids: []uint32{44}}
+	if diff := cmp.Diff(want, got[0].GetUser(), protocmp.Transform()); diff != "" {
+		t.Errorf("app user mismatch (-want +got):\n%s", diff)
+	}
+
+	unresolvable := pushTestImageWithConfig(t, host+"/nobody:v1", v1.Config{User: "nobody", Cmd: []string{"/bin/app"}})
+	spec = &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "app", Image: unresolvable}}}
+	if _, err := s.prepareOCIBundles(t.Context(), "actor-uid-2", resources.ActorRef{}, spec); err == nil {
+		t.Error("prepareOCIBundles succeeded with a USER the image has no passwd entry for, want an error")
+	}
+}
+
+// TestPrepareOCIBundlesStartsInTheImageWorkdir pins that a container starts in
+// its image's WORKDIR, created through the overlay when the image lacks it.
+func TestPrepareOCIBundlesStartsInTheImageWorkdir(t *testing.T) {
+	useTempNodeDirs(t)
+	host := imageVolumeTestRegistry(t)
+	image := pushTestImageWithConfig(t, host+"/app:v1", v1.Config{Cmd: []string{"/bin/app"}, WorkingDir: "/home/nonroot"})
+	spec := &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "app", Image: image}}}
+
+	const actorUID = "actor-uid-1"
+	s := &Atelet{imageCache: newImageVolumeStore(t)}
+	got, err := s.prepareOCIBundles(t.Context(), actorUID, resources.ActorRef{}, spec)
+	if err != nil {
+		t.Fatalf("prepareOCIBundles: %v", err)
+	}
+	if cwd := got[0].GetCwd(); cwd != "/home/nonroot" {
+		t.Errorf("Cwd = %q, want /home/nonroot", cwd)
+	}
+	overlay, err := imagecache.ReadSpec(ateletpath.OCIBundlePath(actorUID, "app"))
+	if err != nil {
+		t.Fatalf("imagecache.ReadSpec: %v", err)
+	}
+	if !slices.Contains(overlay.ExtraDirs, "/home/nonroot") {
+		t.Errorf("ExtraDirs = %v, want the working directory", overlay.ExtraDirs)
+	}
+}
+
 func TestSnapshotManifestRejectsNonLocalFile(t *testing.T) {
 	manifest, err := json.Marshal(sandboxAssetsRecord{
 		SandboxClass:  "gvisor",
-		PauseImage:    testPauseImage,
 		SnapshotFiles: []string{"../outside"},
 	})
 	if err != nil {
@@ -327,7 +346,6 @@ func TestSnapshotManifestRejectsNonLocalFile(t *testing.T) {
 func TestSnapshotManifestRejectsDataFileNotInSnapshotFiles(t *testing.T) {
 	manifest, err := json.Marshal(sandboxAssetsRecord{
 		SandboxClass:      "gvisor",
-		PauseImage:        testPauseImage,
 		SnapshotFiles:     []string{"checkpoint.img"},
 		DataSnapshotFiles: []string{"data.tar"},
 	})
@@ -349,6 +367,7 @@ func TestCheckpointSnapshotFiles(t *testing.T) {
 	}{
 		{name: "required and present", files: []string{"checkpoint.img"}, required: true},
 		{name: "data subset", files: []string{"checkpoint.img", "data.tar"}, data: []string{"data.tar"}, required: true},
+		{name: "fs subdir data subset", files: []string{"checkpoint.img", "fs/fscheckpoint.pb", "fs/multitar.img"}, data: []string{"fs/fscheckpoint.pb", "fs/multitar.img"}, required: true},
 		{name: "data not a snapshot file", files: []string{"checkpoint.img"}, data: []string{"data.tar"}, required: true, wantErr: true},
 		{name: "optional and empty", required: false},
 		{name: "required and empty", required: true, wantErr: true},
@@ -360,7 +379,7 @@ func TestCheckpointSnapshotFiles(t *testing.T) {
 		{name: "manifest name", files: []string{"checkpoint.img", sandboxManifestName}, required: true, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			files, data, err := checkpointSnapshotFiles(&ateompb.CheckpointWorkloadResponse{SnapshotFiles: tc.files, DataSnapshotFiles: tc.data}, tc.required)
+			files, data, err := checkpointSnapshotFiles(&ateworkerpb.CheckpointWorkloadResponse{SnapshotFiles: tc.files, DataSnapshotFiles: tc.data}, tc.required)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("checkpointSnapshotFiles() = %v, %v, %v; wantErr %v", files, data, err, tc.wantErr)
 			}
@@ -389,8 +408,8 @@ func TestUploadSnapshotRejectsSymlinkOutsideRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := &recordingObjectStorage{}
-	err = newPluginHerder(t, store).uploadSnapshot(context.Background(), uri, checkpointDir,
-		&sandboxAssetsRecord{SnapshotFiles: []string{"checkpoint.img"}}, "test", "test")
+	err = newPluginHerder(t, store).uploadSnapshot(context.Background(), testActor, uri, checkpointDir,
+		&sandboxAssetsRecord{SnapshotFiles: []string{"checkpoint.img"}})
 	if err == nil {
 		t.Fatal("uploadSnapshot() followed a symlink outside the checkpoint directory")
 	}
@@ -422,41 +441,12 @@ func TestDownloadExternalCheckpointRejectsSymlinkOutsideRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := newPluginHerder(t, store).downloadExternalCheckpoint(
-		context.Background(), testSnapshotURI, restoreDir, []string{"checkpoint.img"})
+		context.Background(), testActor, testSnapshotURI, restoreDir, []string{"checkpoint.img"}, cacheModeOff)
 	if err == nil {
 		t.Fatal("downloadExternalCheckpoint() followed a symlink outside the restore directory")
 	}
 	if got, err := os.ReadFile(outside); err != nil || string(got) != "keep me" {
 		t.Fatalf("outside file = %q, %v; want unchanged", got, err)
-	}
-}
-
-func TestCopyLocalCheckpointRejectsSymlinkOutsideRoot(t *testing.T) {
-	parent := t.TempDir()
-	snapshotName := "pause-1"
-	snapshotDir := filepath.Join(parent, "local-checkpoint", snapshotName)
-	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	outside := filepath.Join(parent, "outside")
-	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(snapshotDir, "checkpoint.img")); err != nil {
-		t.Fatal(err)
-	}
-	restoreDir := filepath.Join(parent, "restore-state")
-	if err := os.Mkdir(restoreDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-
-	err := (&AteomHerder{}).copyLocalCheckpoint(context.Background(), parent, snapshotName,
-		filepath.Join(parent, "local-checkpoint"), restoreDir, []string{"checkpoint.img"})
-	if err == nil {
-		t.Fatal("copyLocalCheckpoint() followed a symlink outside the local checkpoint directory")
-	}
-	if _, err := os.Stat(filepath.Join(restoreDir, "checkpoint.img")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("restore file exists after rejected copy: %v", err)
 	}
 }
 
@@ -488,322 +478,64 @@ func TestCheckLocalSnapshotFilesRejectsSymlink(t *testing.T) {
 	}
 }
 
-func TestWriteFileAtomic(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "actor-id")
-
-	// One shared write over an existing value, as happens on every resume;
-	// each subtest checks one postcondition.
-	if err := os.WriteFile(target, []byte("golden-id"), 0o600); err != nil {
-		t.Fatalf("seeding target: %v", err)
-	}
-	if err := writeFileAtomic(target, []byte("counter-1"), 0o644); err != nil {
-		t.Fatalf("writeFileAtomic: %v", err)
-	}
-
-	t.Run("replaces content", func(t *testing.T) {
-		got, err := os.ReadFile(target)
-		if err != nil {
-			t.Fatalf("reading target: %v", err)
-		}
-		if string(got) != "counter-1" {
-			t.Errorf("content = %q, want %q", got, "counter-1")
-		}
-	})
-
-	t.Run("sets permissions", func(t *testing.T) {
-		info, err := os.Stat(target)
-		if err != nil {
-			t.Fatalf("stat target: %v", err)
-		}
-		if perm := info.Mode().Perm(); perm != 0o644 {
-			t.Errorf("perm = %o, want 644", perm)
-		}
-	})
-
-	t.Run("leaves no temp files", func(t *testing.T) {
-		// The directory is visible inside the actor.
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			t.Fatalf("reading dir: %v", err)
-		}
-		if len(entries) != 1 {
-			names := make([]string, 0, len(entries))
-			for _, e := range entries {
-				names = append(names, e.Name())
-			}
-			t.Errorf("leftover files in identity dir: %v", names)
-		}
-	})
-}
-
-// validRunRequest, validCheckpointRequest, and validRestoreRequest build
-// requests whose every field passes validation; the per-request tests below
-// break one field per case.
-func validRunRequest() *ateletpb.RunRequest {
-	return &ateletpb.RunRequest{
-		Atespace:              "ate-demo",
-		ActorName:             "counter-1",
-		ActorTemplateAtespace: "ate-demo",
-		ActorTemplateName:     "counter",
-		WorkerPodUid:          "422938ba-8860-4983-a25d-d6bcb0a69d4e",
-		ActorUid:              "123e4567-e89b-12d3-a456-426614174000",
-		Spec:                  &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "worker"}}},
-	}
-}
-
-func validCheckpointRequest() *ateletpb.CheckpointRequest {
-	return &ateletpb.CheckpointRequest{
-		Atespace:              "ate-demo",
-		ActorName:             "counter-1",
-		ActorTemplateAtespace: "ate-demo",
-		ActorTemplateName:     "counter",
-		WorkerPodUid:          "422938ba-8860-4983-a25d-d6bcb0a69d4e",
-		ActorUid:              "123e4567-e89b-12d3-a456-426614174000",
-		Spec:                  &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "worker"}}},
-		Type:                  ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL,
-		Config: &ateletpb.CheckpointRequest_ExternalConfig{
-			ExternalConfig: &ateletpb.ExternalCheckpointConfiguration{
-				SnapshotUri: testSnapshotURI,
-			},
-		},
-		Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
-	}
-}
-
-func validRestoreRequest() *ateletpb.RestoreRequest {
-	return &ateletpb.RestoreRequest{
-		Atespace:              "ate-demo",
-		ActorName:             "counter-1",
-		ActorTemplateAtespace: "ate-demo",
-		ActorTemplateName:     "counter",
-		WorkerPodUid:          "422938ba-8860-4983-a25d-d6bcb0a69d4e",
-		ActorUid:              "123e4567-e89b-12d3-a456-426614174000",
-		Spec:                  &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "worker"}}},
-		Type:                  ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL,
-		Config: &ateletpb.RestoreRequest_ExternalConfig{
-			ExternalConfig: &ateletpb.ExternalRestoreConfiguration{
-				SnapshotUri: testSnapshotURI,
-			},
-		},
-		Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
-		SandboxAssets: &ateletpb.SandboxAssets{
-			SandboxClass: "gvisor",
-			PauseImage:   testPauseImage,
-		},
-	}
-}
-
-func TestValidateRunRequest(t *testing.T) {
-	tests := []struct {
-		name    string
-		mutate  func(*ateletpb.RunRequest)
-		wantErr bool
-	}{
-		{"valid", func(*ateletpb.RunRequest) {}, false},
-		{"invalid worker pod uid", func(r *ateletpb.RunRequest) { r.WorkerPodUid = "../escape" }, true},
-		{"invalid atespace", func(r *ateletpb.RunRequest) { r.Atespace = "../escape" }, true},
-		{"invalid actor name", func(r *ateletpb.RunRequest) { r.ActorName = "../escape" }, true},
-		{"invalid actor uid", func(r *ateletpb.RunRequest) { r.ActorUid = "../escape" }, true},
-		{"any actor template identity accepted", func(r *ateletpb.RunRequest) { r.ActorTemplateAtespace, r.ActorTemplateName = "Not_Valid", "Not_Valid" }, false},
-		{"empty actor template identity accepted", func(r *ateletpb.RunRequest) { r.ActorTemplateAtespace, r.ActorTemplateName = "", "" }, false},
-		{"invalid container name", func(r *ateletpb.RunRequest) {
-			r.Spec.Containers = []*ateletpb.Container{{Name: "../escape"}}
-		}, true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			req := validRunRequest()
-			tc.mutate(req)
-			if err := validateRunRequest(req); (err != nil) != tc.wantErr {
-				t.Errorf("validateRunRequest err = %v, wantErr %v", err, tc.wantErr)
-			}
-		})
-	}
-}
-
-// Checkpoint and Restore must reject a bad snapshot URI even when
-// every common field is valid.
-func TestValidateCheckpointRequest(t *testing.T) {
-	makeReq := func(opts ...func(*ateletpb.CheckpointRequest)) *ateletpb.CheckpointRequest {
-		r := validCheckpointRequest()
-		for _, opt := range opts {
-			opt(r)
-		}
-		return r
-	}
-
-	tests := []struct {
-		name    string
-		req     *ateletpb.CheckpointRequest
-		wantErr bool
-	}{
-		{"valid", makeReq(), false},
-		{"empty snapshot uri", makeReq(func(r *ateletpb.CheckpointRequest) { r.GetExternalConfig().SnapshotUri = "" }), true},
-		{"bucketless snapshot uri", makeReq(func(r *ateletpb.CheckpointRequest) { r.GetExternalConfig().SnapshotUri = "relative/path" }), true},
-		{"invalid worker pod uid", makeReq(func(r *ateletpb.CheckpointRequest) { r.WorkerPodUid = "../escape" }), true},
-		{"invalid atespace", makeReq(func(r *ateletpb.CheckpointRequest) { r.Atespace = "../escape" }), true},
-		{"invalid actor name", makeReq(func(r *ateletpb.CheckpointRequest) { r.ActorName = "../escape" }), true},
-		{"invalid actor uid", makeReq(func(r *ateletpb.CheckpointRequest) { r.ActorUid = "../escape" }), true},
-		{"any actor template identity accepted", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.ActorTemplateAtespace, r.ActorTemplateName = "Not_Valid", "Not_Valid"
-		}), false},
-		{"empty actor template identity accepted", makeReq(func(r *ateletpb.CheckpointRequest) { r.ActorTemplateAtespace, r.ActorTemplateName = "", "" }), false},
-		{"invalid container name", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.Spec.Containers = []*ateletpb.Container{{Name: "../escape"}}
-		}), true},
-		{"invalid local snapshot prefix", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.CheckpointRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: ""}}
-		}), true},
-		{"local snapshot name escapes its directory", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.CheckpointRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "../escape"}}
-		}), true},
-		{"nested local snapshot prefix", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.CheckpointRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause/2"}}
-		}), true},
-		{"traversal local snapshot prefix", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.CheckpointRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: ".."}}
-		}), true},
-		{"unspecified snapshot type", makeReq(func(r *ateletpb.CheckpointRequest) { r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_UNSPECIFIED }), true},
-		{"unspecified snapshot fidelity", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.Fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED
-		}), true},
-		{"invalid snapshot fidelity", makeReq(func(r *ateletpb.CheckpointRequest) { r.Fidelity = ateletpb.SnapshotFidelity(23) }), true},
-		{"rootfs fidelity", makeReq(func(r *ateletpb.CheckpointRequest) {
-			r.Fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
-		}), false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := validateCheckpointRequest(tc.req); (err != nil) != tc.wantErr {
-				t.Errorf("validateCheckpointRequest err = %v, wantErr %v", err, tc.wantErr)
-			}
-		})
-	}
-}
-
-func TestValidateRestoreRequest(t *testing.T) {
-	makeReq := func(opts ...func(*ateletpb.RestoreRequest)) *ateletpb.RestoreRequest {
-		r := validRestoreRequest()
-		for _, opt := range opts {
-			opt(r)
-		}
-		return r
-	}
-
-	tests := []struct {
-		name    string
-		req     *ateletpb.RestoreRequest
-		wantErr bool
-	}{
-		{"valid", makeReq(), false},
-		{"missing sandbox assets", makeReq(func(r *ateletpb.RestoreRequest) { r.SandboxAssets = nil }), true},
-		{"empty snapshot uri", makeReq(func(r *ateletpb.RestoreRequest) { r.GetExternalConfig().SnapshotUri = "" }), true},
-		{"bucketless snapshot uri", makeReq(func(r *ateletpb.RestoreRequest) { r.GetExternalConfig().SnapshotUri = "relative/path" }), true},
-		{"invalid worker pod uid", makeReq(func(r *ateletpb.RestoreRequest) { r.WorkerPodUid = "../escape" }), true},
-		{"invalid atespace", makeReq(func(r *ateletpb.RestoreRequest) { r.Atespace = "../escape" }), true},
-		{"invalid actor name", makeReq(func(r *ateletpb.RestoreRequest) { r.ActorName = "../escape" }), true},
-		{"invalid actor uid", makeReq(func(r *ateletpb.RestoreRequest) { r.ActorUid = "../escape" }), true},
-		{"any actor template identity accepted", makeReq(func(r *ateletpb.RestoreRequest) {
-			r.ActorTemplateAtespace, r.ActorTemplateName = "Not_Valid", "Not_Valid"
-		}), false},
-		{"empty actor template identity accepted", makeReq(func(r *ateletpb.RestoreRequest) { r.ActorTemplateAtespace, r.ActorTemplateName = "", "" }), false},
-		{"invalid container name", makeReq(func(r *ateletpb.RestoreRequest) {
-			r.Spec.Containers = []*ateletpb.Container{{Name: "../escape"}}
-		}), true},
-		{"invalid local snapshot prefix", makeReq(func(r *ateletpb.RestoreRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.RestoreRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: ""}}
-		}), true},
-		{"local snapshot name escapes its directory", makeReq(func(r *ateletpb.RestoreRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.RestoreRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "../escape"}}
-		}), true},
-		{"nested local snapshot prefix", makeReq(func(r *ateletpb.RestoreRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.RestoreRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause/2"}}
-		}), true},
-		{"traversal local snapshot prefix", makeReq(func(r *ateletpb.RestoreRequest) {
-			r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
-			r.Config = &ateletpb.RestoreRequest_LocalConfig{LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: ".."}}
-		}), true},
-		{"unspecified snapshot type", makeReq(func(r *ateletpb.RestoreRequest) { r.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_UNSPECIFIED }), true},
-		{"unspecified snapshot fidelity", makeReq(func(r *ateletpb.RestoreRequest) { r.Fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED }), true},
-		{"invalid snapshot fidelity", makeReq(func(r *ateletpb.RestoreRequest) { r.Fidelity = ateletpb.SnapshotFidelity(23) }), true},
-		{"rootfs fidelity", makeReq(func(r *ateletpb.RestoreRequest) {
-			r.Fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
-		}), false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if err := validateRestoreRequest(tc.req); (err != nil) != tc.wantErr {
-				t.Errorf("validateRestoreRequest err = %v, wantErr %v", err, tc.wantErr)
-			}
-		})
-	}
-}
-
-// Every valid atelet scope must map to its ateom counterpart.
-func TestToAteomFidelity(t *testing.T) {
+// Every valid atelet scope must map to its worker counterpart.
+func TestToWorkerFidelity(t *testing.T) {
 	tests := []struct {
 		in   ateletpb.SnapshotFidelity
-		want ateompb.SnapshotFidelity
+		want ateworkerpb.SnapshotFidelity
 	}{
-		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY},
-		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES},
-		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS, ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS},
-		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED, ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED},
-		{ateletpb.SnapshotFidelity(99), ateompb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED},
+		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY},
+		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES},
+		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS},
+		{ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED, ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED},
+		{ateletpb.SnapshotFidelity(99), ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED},
 	}
 	for _, tc := range tests {
-		if got := toAteomFidelity(tc.in); got != tc.want {
-			t.Errorf("toAteomFidelity(%v) = %v, want %v", tc.in, got, tc.want)
+		if got := toWorkerFidelity(tc.in); got != tc.want {
+			t.Errorf("toWorkerFidelity(%v) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }
 
-// TestFetchAssetRejectsBadHash confirms fetchAsset validates the asset hash
-// before the cache-hit os.Stat/early-return, not merely "at some point". To
-// prove the ordering, it plants a real file at the exact path an invalid hash
-// resolves to: a correctly-ordered fetchAsset validates first and returns an
-// error, while a regression that stats first would find this file and return it
-// with a nil error, failing the test. StaticFilesDir is redirected to a temp
-// dir so the planted path is writable and isolated.
-func TestFetchAssetRejectsBadHash(t *testing.T) {
-	orig := nodepath.StaticFilesDir
-	nodepath.StaticFilesDir = t.TempDir()
-	t.Cleanup(func() { nodepath.StaticFilesDir = orig })
-
-	// Invalid (8 chars, not 64) but separator-free, so it resolves to a normal
-	// filename inside the temp StaticFilesDir.
-	const badHash = "deadbeef"
-	if err := os.WriteFile(ateletpath.RunSCBinaryPath(badHash), []byte("planted"), 0o755); err != nil {
-		t.Fatalf("planting cache file: %v", err)
+// TestStageAssetRejectsBadHash confirms stageAsset validates the asset hash
+// before it looks for an already-staged file, not merely "at some point". To
+// prove the ordering, it plants a file at the destination: a correctly-ordered
+// stageAsset validates first and returns an error, while a regression that
+// checked the destination first would find this file and return it with a
+// nil error, failing the test.
+func TestStageAssetRejectsBadHash(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "asset")
+	if err := os.WriteFile(dst, []byte("planted"), 0o755); err != nil {
+		t.Fatalf("planting staged file: %v", err)
 	}
 
-	s := &AteomHerder{}
-	_, err := s.fetchAsset(context.Background(), assetEntry{SHA256: badHash})
+	s := &Atelet{sandboxAssetCache: newTestAssetCache(t)}
+	_, err := s.stageAsset(context.Background(), assetEntry{SHA256: "deadbeef"}, dst)
 	if err == nil {
-		t.Fatal("fetchAsset returned a cache hit for an invalid hash; validation must run before the os.Stat early return")
+		t.Fatal("stageAsset returned the planted file for an invalid hash; validation must run before the staged check")
 	}
 	// The error must come from the validation step, proving it ran before the
-	// cache-hit stat could return the planted file.
+	// staged check could return the planted file.
 	if !strings.Contains(err.Error(), "while validating asset hash") {
 		t.Errorf("error did not come from hash validation: %v", err)
 	}
 }
 
-// fakeObjectStorage serves fixed bytes for GetObject so fetchAsset can be tested.
+// fakeObjectStorage serves fixed bytes for GetObject so stageAsset can be tested.
 type fakeObjectStorage struct {
 	data []byte
 	err  error
+	// gets, if set, counts GetObject calls.
+	gets *atomic.Int32
+	// delay, if set, holds each GetObject so concurrent callers overlap.
+	delay time.Duration
 }
 
 func (f fakeObjectStorage) GetObject(_ context.Context, _, _ string) (io.ReadCloser, error) {
+	if f.gets != nil {
+		f.gets.Add(1)
+	}
+	time.Sleep(f.delay)
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -812,92 +544,123 @@ func (f fakeObjectStorage) GetObject(_ context.Context, _, _ string) (io.ReadClo
 
 func (fakeObjectStorage) PutObject(_ context.Context, _, _ string, _ io.Reader) error { return nil }
 
-// TestFetchAssetStreaming covers the streamed download: good asset cached,
-// over-cap rejected, hash mismatch rejected (failures leave no cache file).
-func TestFetchAssetStreaming(t *testing.T) {
-	origDir, origCap := nodepath.StaticFilesDir, maxAssetBytes
-	t.Cleanup(func() { nodepath.StaticFilesDir, maxAssetBytes = origDir, origCap })
+// TestStageAssetStreaming covers the streamed download: good asset cached
+// and staged, over-cap rejected, hash mismatch rejected (failures leave no
+// cache entry).
+func TestStageAssetStreaming(t *testing.T) {
+	origCap := maxAssetBytes
+	t.Cleanup(func() { maxAssetBytes = origCap })
 
 	content := []byte("micro-vm kernel bytes")
 	goodHash := fmt.Sprintf("%x", sha256.Sum256(content))
 	const url = "gs://test-bucket/asset"
 
-	t.Run("good asset is cached", func(t *testing.T) {
-		nodepath.StaticFilesDir = t.TempDir()
-		s := &AteomHerder{anonGCSClient: fakeObjectStorage{data: content}}
-		path, err := s.fetchAsset(context.Background(), assetEntry{URL: url, SHA256: goodHash})
+	t.Run("good asset is cached and staged", func(t *testing.T) {
+		root := t.TempDir()
+		s := &Atelet{sandboxAssetCache: newTestAssetCacheAt(t, root), anonGCSClient: fakeObjectStorage{data: content}}
+		path, err := stageTestAsset(t, s, root, assetEntry{URL: url, SHA256: goodHash})
 		if err != nil {
-			t.Fatalf("fetchAsset: %v", err)
+			t.Fatalf("stageAsset: %v", err)
 		}
 		got, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("reading cached asset: %v", err)
+			t.Fatalf("reading staged asset: %v", err)
 		}
 		if !bytes.Equal(got, content) {
-			t.Errorf("cached bytes = %q, want %q", got, content)
+			t.Errorf("staged bytes = %q, want %q", got, content)
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Mode().Perm() != 0o555 {
+			t.Errorf("staged mode = %v, want 0555 (read-only, executable)", fi.Mode().Perm())
+		}
+		if n := cachedAssets(t, root); n != 1 {
+			t.Errorf("cache holds %d assets, want 1", n)
 		}
 	})
 
 	t.Run("over-cap asset rejected, cache not written", func(t *testing.T) {
-		nodepath.StaticFilesDir = t.TempDir()
+		root := t.TempDir()
 		maxAssetBytes = 4 // content is longer than this
-		s := &AteomHerder{anonGCSClient: fakeObjectStorage{data: content}}
-		_, err := s.fetchAsset(context.Background(), assetEntry{URL: url, SHA256: goodHash})
+		s := &Atelet{sandboxAssetCache: newTestAssetCacheAt(t, root), anonGCSClient: fakeObjectStorage{data: content}}
+		_, err := stageTestAsset(t, s, root, assetEntry{URL: url, SHA256: goodHash})
 		if err == nil {
-			t.Fatal("fetchAsset accepted an over-cap asset")
+			t.Fatal("stageAsset accepted an over-cap asset")
 		}
-		if _, err := os.Stat(ateletpath.RunSCBinaryPath(goodHash)); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("over-cap download left a file at the cache path (stat err = %v)", err)
+		if n := cachedAssets(t, root); n != 0 {
+			t.Errorf("over-cap download left %d assets in the cache", n)
 		}
 	})
 
 	t.Run("hash mismatch rejected, cache not written", func(t *testing.T) {
-		nodepath.StaticFilesDir = t.TempDir()
+		root := t.TempDir()
 		maxAssetBytes = origCap
 		wrongHash := strings.Repeat("a", 64) // valid 64-hex format, wrong value
-		s := &AteomHerder{anonGCSClient: fakeObjectStorage{data: content}}
-		_, err := s.fetchAsset(context.Background(), assetEntry{URL: url, SHA256: wrongHash})
+		s := &Atelet{sandboxAssetCache: newTestAssetCacheAt(t, root), anonGCSClient: fakeObjectStorage{data: content}}
+		_, err := stageTestAsset(t, s, root, assetEntry{URL: url, SHA256: wrongHash})
 		if err == nil {
-			t.Fatal("fetchAsset accepted a hash mismatch")
+			t.Fatal("stageAsset accepted a hash mismatch")
 		}
-		if _, err := os.Stat(ateletpath.RunSCBinaryPath(wrongHash)); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("mismatched download left a file at the cache path (stat err = %v)", err)
+		if n := cachedAssets(t, root); n != 0 {
+			t.Errorf("mismatched download left %d assets in the cache", n)
 		}
 	})
 
 	t.Run("missing object keeps the client's sentinel", func(t *testing.T) {
-		nodepath.StaticFilesDir = t.TempDir()
+		root := t.TempDir()
 		maxAssetBytes = origCap
 		// The objectstorage clients tag a missing object with ErrObjectNotFound.
 		notFound := fmt.Errorf("%w: no such object", objectstorage.ErrObjectNotFound)
-		s := &AteomHerder{anonGCSClient: fakeObjectStorage{err: notFound}}
-		_, err := s.fetchAsset(context.Background(), assetEntry{URL: url, SHA256: goodHash})
+		s := &Atelet{sandboxAssetCache: newTestAssetCacheAt(t, root), anonGCSClient: fakeObjectStorage{err: notFound}}
+		_, err := stageTestAsset(t, s, root, assetEntry{URL: url, SHA256: goodHash})
 		if !errors.Is(err, objectstorage.ErrObjectNotFound) {
 			t.Errorf("missing-object error lost the client's sentinel: %v", err)
 		}
 	})
 
 	t.Run("malformed url is rejected", func(t *testing.T) {
-		nodepath.StaticFilesDir = t.TempDir()
+		root := t.TempDir()
 		maxAssetBytes = origCap
-		s := &AteomHerder{anonGCSClient: fakeObjectStorage{data: content}}
+		s := &Atelet{sandboxAssetCache: newTestAssetCacheAt(t, root), anonGCSClient: fakeObjectStorage{data: content}}
 		// Invalid percent-escape: url.Parse rejects it inside objectstorage.Open.
-		_, err := s.fetchAsset(context.Background(), assetEntry{URL: "gs://bucket/%zz", SHA256: goodHash})
+		_, err := stageTestAsset(t, s, root, assetEntry{URL: "gs://bucket/%zz", SHA256: goodHash})
 		if err == nil {
-			t.Fatal("fetchAsset accepted a malformed URL")
+			t.Fatal("stageAsset accepted a malformed URL")
 		}
 	})
 
 	t.Run("network error keeps its context wrap", func(t *testing.T) {
-		nodepath.StaticFilesDir = t.TempDir()
+		root := t.TempDir()
 		maxAssetBytes = origCap
-		s := &AteomHerder{anonGCSClient: fakeObjectStorage{err: errors.New("connection refused")}}
-		_, err := s.fetchAsset(context.Background(), assetEntry{URL: url, SHA256: goodHash})
+		s := &Atelet{sandboxAssetCache: newTestAssetCacheAt(t, root), anonGCSClient: fakeObjectStorage{err: errors.New("connection refused")}}
+		_, err := stageTestAsset(t, s, root, assetEntry{URL: url, SHA256: goodHash})
 		if err == nil {
-			t.Fatal("fetchAsset accepted a failing open")
+			t.Fatal("stageAsset accepted a failing open")
 		}
 		if !strings.Contains(err.Error(), "while fetching") {
 			t.Errorf("open failure lost its context wrap: %v", err)
+		}
+	})
+
+	t.Run("already staged asset is kept without a fetch", func(t *testing.T) {
+		root := t.TempDir()
+		maxAssetBytes = origCap
+		var gets atomic.Int32
+		s := &Atelet{sandboxAssetCache: newTestAssetCacheAt(t, root), anonGCSClient: fakeObjectStorage{data: content, gets: &gets}}
+		path, err := stageTestAsset(t, s, root, assetEntry{URL: url, SHA256: goodHash})
+		if err != nil {
+			t.Fatalf("stageAsset: %v", err)
+		}
+		// A Checkpoint or Terminate of the same activation finds the link
+		// Run staged and uses it as it is.
+		again, err := s.stageAsset(context.Background(), assetEntry{URL: url, SHA256: goodHash}, path)
+		if err != nil || again != path {
+			t.Fatalf("stageAsset onto a staged path = %q, %v; want %q", again, err, path)
+		}
+		if gets.Load() != 1 {
+			t.Errorf("object fetched %d times, want 1", gets.Load())
 		}
 	})
 }
@@ -908,11 +671,14 @@ func TestFetchAssetStreaming(t *testing.T) {
 // Internal. Guards against a future removal or reordering of the validation
 // call at any boundary.
 func TestRPCBoundariesReject(t *testing.T) {
-	s := &AteomHerder{}
+	s := &Atelet{}
 	ctx := context.Background()
 	badUID := "../escape" // valid actor ref, invalid worker pod UID
 	const okAtespace, okID, okActorUID = "ate-demo", "counter-1", "123e4567-e89b-12d3-a456-426614174000"
-	okSpec := &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "worker"}}}
+	okSpec := &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{
+		Name:  "worker",
+		Image: "example.com/app@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+	}}}
 
 	wantInvalidArgument := func(t *testing.T, rpc string, err error) {
 		t.Helper()
@@ -956,14 +722,14 @@ func TestRPCBoundariesReject(t *testing.T) {
 	})
 }
 
-func TestBuildAteomWorkloadSpecForwardsWakeupProbe(t *testing.T) {
+func TestBuildWorkerWorkloadSpecForwardsWakeupProbe(t *testing.T) {
 	in := &ateletpb.WorkloadSpec{
 		Containers: []*ateletpb.Container{
 			{
 				Name:  "with-probe",
 				Image: "main",
 				WakeupProbe: &ateletpb.WakeupProbe{
-					HttpGet:        &ateletpb.HTTPGetAction{Path: "/health", Port: 8080},
+					HttpGet:        &ateletpb.HttpGetAction{Path: "/health", Port: 8080},
 					TimeoutSeconds: 45,
 				},
 			},
@@ -972,57 +738,57 @@ func TestBuildAteomWorkloadSpecForwardsWakeupProbe(t *testing.T) {
 			},
 		},
 	}
-	want := &ateompb.WorkloadSpec{
-		Containers: []*ateompb.Container{
+	want := &ateworkerpb.WorkloadSpec{
+		Containers: []*ateworkerpb.Container{
 			{
 				Name: "with-probe",
-				WakeupProbe: &ateompb.WakeupProbe{
-					HttpGet:        &ateompb.HTTPGetAction{Path: "/health", Port: 8080},
+				WakeupProbe: &ateworkerpb.WakeupProbe{
+					HttpGet:        &ateworkerpb.HttpGetAction{Path: "/health", Port: 8080},
 					TimeoutSeconds: 45,
 				},
 			},
 			{Name: "without-probe"},
 		},
 	}
-	got, err := buildAteomWorkloadSpec(in, nil)
+	got, err := buildWorkerWorkloadSpec(in, nil)
 	if err != nil {
-		t.Fatalf("buildAteomWorkloadSpec failed: %v", err)
+		t.Fatalf("buildWorkerWorkloadSpec failed: %v", err)
 	}
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
-		t.Errorf("buildAteomWorkloadSpec mismatch (-want +got):\n%s", diff)
+		t.Errorf("buildWorkerWorkloadSpec mismatch (-want +got):\n%s", diff)
 	}
 }
 
-func TestBuildAteomWorkloadSpecForwardsContainerSpecs(t *testing.T) {
+func TestBuildWorkerWorkloadSpecForwardsContainerSpecs(t *testing.T) {
 	in := &ateletpb.WorkloadSpec{
 		Containers: []*ateletpb.Container{{Name: "main"}, {Name: "sidecar"}},
 	}
-	containerSpecs := []*ateompb.ContainerSpec{
+	containerSpecs := []*ateworkerpb.ContainerSpec{
 		{Args: []string{"/app", "serve"}},
 		{Args: []string{"/sidecar"}},
 	}
-	want := &ateompb.WorkloadSpec{
-		Containers: []*ateompb.Container{
-			{Name: "main", ContainerSpec: &ateompb.ContainerSpec{Args: []string{"/app", "serve"}}},
-			{Name: "sidecar", ContainerSpec: &ateompb.ContainerSpec{Args: []string{"/sidecar"}}},
+	want := &ateworkerpb.WorkloadSpec{
+		Containers: []*ateworkerpb.Container{
+			{Name: "main", ContainerSpec: &ateworkerpb.ContainerSpec{Args: []string{"/app", "serve"}}},
+			{Name: "sidecar", ContainerSpec: &ateworkerpb.ContainerSpec{Args: []string{"/sidecar"}}},
 		},
 	}
-	got, err := buildAteomWorkloadSpec(in, containerSpecs)
+	got, err := buildWorkerWorkloadSpec(in, containerSpecs)
 	if err != nil {
-		t.Fatalf("buildAteomWorkloadSpec failed: %v", err)
+		t.Fatalf("buildWorkerWorkloadSpec failed: %v", err)
 	}
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
-		t.Errorf("buildAteomWorkloadSpec mismatch (-want +got):\n%s", diff)
+		t.Errorf("buildWorkerWorkloadSpec mismatch (-want +got):\n%s", diff)
 	}
 }
 
-func TestBuildAteomWorkloadSpecForwardsDurableDirMounts(t *testing.T) {
+func TestBuildWorkerWorkloadSpecForwardsDurableDirMounts(t *testing.T) {
 	in := &ateletpb.WorkloadSpec{
 		Volumes: []*ateletpb.Volume{
-			{Name: "data", Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}}},
-			{Name: "cache", Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}}},
-			{Name: "scratch", Source: &ateletpb.Volume_External{External: &ateletpb.ExternalVolumeSource{}}},
-			{Name: "system-info", Source: &ateletpb.Volume_SystemInfo{SystemInfo: &ateletpb.SystemInfoVolume{}}},
+			{Name: "data", DurableDir: &ateletpb.DurableDirVolumeSource{}},
+			{Name: "cache", DurableDir: &ateletpb.DurableDirVolumeSource{}},
+			{Name: "scratch", External: &ateletpb.ExternalVolumeSource{}},
+			{Name: "system-info", SystemInfo: &ateletpb.SystemInfoVolumeSource{}},
 		},
 		Containers: []*ateletpb.Container{
 			{
@@ -1043,42 +809,42 @@ func TestBuildAteomWorkloadSpecForwardsDurableDirMounts(t *testing.T) {
 			{Name: "no-volumes"},
 		},
 	}
-	// ateom needs the volume NAME as well as the path: the name selects the
+	// worker needs the volume NAME as well as the path: the name selects the
 	// per-volume directory on the host, and an actor may have several.
-	want := &ateompb.WorkloadSpec{
-		Containers: []*ateompb.Container{
+	want := &ateworkerpb.WorkloadSpec{
+		Containers: []*ateworkerpb.Container{
 			{
 				Name: "main",
-				DurableDirVolumeMounts: []*ateompb.DurableDirVolumeMount{
-					{VolumeName: "data", MountPath: "/home/counter"},
-					{VolumeName: "cache", MountPath: "/var/cache"},
+				DurableDirVolumeMounts: []*ateworkerpb.VolumeMount{
+					{Name: "data", MountPath: "/home/counter"},
+					{Name: "cache", MountPath: "/var/cache"},
 				},
-				CsiVolumeMounts: []*ateompb.VolumeMount{
-					{VolumeName: "scratch", MountPath: "/scratch"},
+				ExternalVolumeMounts: []*ateworkerpb.VolumeMount{
+					{Name: "scratch", MountPath: "/scratch"},
 				},
-				SystemInfoVolumeMounts: []*ateompb.SystemInfoVolumeMount{
-					{VolumeName: "system-info", MountPath: "/run/ate"},
+				SystemInfoVolumeMounts: []*ateworkerpb.VolumeMount{
+					{Name: "system-info", MountPath: "/run/ate"},
 				},
 			},
 			{
 				Name: "sidecar",
-				DurableDirVolumeMounts: []*ateompb.DurableDirVolumeMount{
-					{VolumeName: "data", MountPath: "/shared"},
+				DurableDirVolumeMounts: []*ateworkerpb.VolumeMount{
+					{Name: "data", MountPath: "/shared"},
 				},
 			},
 			{Name: "no-volumes"},
 		},
 	}
-	got, err := buildAteomWorkloadSpec(in, nil)
+	got, err := buildWorkerWorkloadSpec(in, nil)
 	if err != nil {
-		t.Fatalf("buildAteomWorkloadSpec failed: %v", err)
+		t.Fatalf("buildWorkerWorkloadSpec failed: %v", err)
 	}
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
-		t.Errorf("buildAteomWorkloadSpec mismatch (-want +got):\n%s", diff)
+		t.Errorf("buildWorkerWorkloadSpec mismatch (-want +got):\n%s", diff)
 	}
 }
 
-func TestBuildAteomWorkloadSpecValidation(t *testing.T) {
+func TestBuildWorkerWorkloadSpecValidation(t *testing.T) {
 	tests := []struct {
 		name    string
 		in      *ateletpb.WorkloadSpec
@@ -1088,7 +854,7 @@ func TestBuildAteomWorkloadSpecValidation(t *testing.T) {
 			name: "missing volume definition",
 			in: &ateletpb.WorkloadSpec{
 				Volumes: []*ateletpb.Volume{
-					{Name: "data", Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}}},
+					{Name: "data", DurableDir: &ateletpb.DurableDirVolumeSource{}},
 				},
 				Containers: []*ateletpb.Container{
 					{
@@ -1116,14 +882,14 @@ func TestBuildAteomWorkloadSpecValidation(t *testing.T) {
 					},
 				},
 			},
-			wantErr: `container "ctr" mounts volume "data" with unsupported source <nil>`,
+			wantErr: `container "ctr" mounts volume "data" with no source set`,
 		},
 		{
 			name: "duplicate volume names",
 			in: &ateletpb.WorkloadSpec{
 				Volumes: []*ateletpb.Volume{
-					{Name: "data", Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}}},
-					{Name: "data", Source: &ateletpb.Volume_External{External: &ateletpb.ExternalVolumeSource{}}},
+					{Name: "data", DurableDir: &ateletpb.DurableDirVolumeSource{}},
+					{Name: "data", External: &ateletpb.ExternalVolumeSource{}},
 				},
 				Containers: []*ateletpb.Container{
 					{
@@ -1140,7 +906,7 @@ func TestBuildAteomWorkloadSpecValidation(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := buildAteomWorkloadSpec(tc.in, nil)
+			_, err := buildWorkerWorkloadSpec(tc.in, nil)
 			if err == nil {
 				t.Fatal("expected error, got nil")
 			}
@@ -1151,14 +917,14 @@ func TestBuildAteomWorkloadSpecValidation(t *testing.T) {
 	}
 }
 
-func TestToAteomEgressGateway(t *testing.T) {
-	if got := toAteomEgressGateway(nil); got != nil {
-		t.Fatalf("toAteomEgressGateway(nil) = %v, want nil", got)
+func TestToWorkerEgressGateway(t *testing.T) {
+	if got := toWorkerEgressGateway(nil); got != nil {
+		t.Fatalf("toWorkerEgressGateway(nil) = %v, want nil", got)
 	}
-	want := &ateompb.EgressGateway{Address: "egress.example:443"}
-	got := toAteomEgressGateway(&ateletpb.EgressGateway{Address: want.Address})
+	want := &ateworkerpb.EgressGateway{Address: "egress.example:443"}
+	got := toWorkerEgressGateway(&ateletpb.EgressGateway{Address: want.Address})
 	if diff := cmp.Diff(want, got, protocmp.Transform()); diff != "" {
-		t.Errorf("toAteomEgressGateway mismatch (-want +got):\n%s", diff)
+		t.Errorf("toWorkerEgressGateway mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -1166,39 +932,115 @@ func TestRemoveActorDirsReclaimsTheRoot(t *testing.T) {
 	useTempNodeDirs(t)
 	const actorUID = "actor-uid-1"
 
-	if err := resetActorDirs(actorUID); err != nil {
-		t.Fatalf("resetActorDirs: %v", err)
+	if err := actordirs.ResetActorDirs(actorUID); err != nil {
+		t.Fatalf("ResetActorDirs: %v", err)
 	}
 	// Written at Run and deliberately kept out of the directories reset wipes.
 	if err := os.WriteFile(ateletpath.ActorSandboxAssetsFile(actorUID), []byte("{}"), 0o600); err != nil {
 		t.Fatalf("writing sandbox assets file: %v", err)
 	}
 
-	if err := removeActorDirs(actorUID); err != nil {
-		t.Fatalf("removeActorDirs: %v", err)
+	if err := actordirs.RemoveActorDirs(actorUID); err != nil {
+		t.Fatalf("RemoveActorDirs: %v", err)
 	}
 
-	actorDir := ateletpath.ActorPath(actorUID)
-	if entries, err := os.ReadDir(actorDir); err == nil {
-		left := make([]string, 0, len(entries))
-		for _, e := range entries {
-			left = append(left, e.Name())
+	assertDirGone(t, "actor dir", ateletpath.ActorPath(actorUID))
+
+	assertDirGone(t, "actor snapshot dir", ateletpath.ActorSnapshotPath(actorUID))
+}
+
+// assertDirGone fails t if dir still exists, naming what is left in it.
+func assertDirGone(t *testing.T, what, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return
+	}
+	if err != nil {
+		t.Errorf("reading %s %s: %v", what, dir, err)
+		return
+	}
+	left := make([]string, 0, len(entries))
+	for _, e := range entries {
+		left = append(left, e.Name())
+	}
+	t.Errorf("%s %s survived with %d entries: %v", what, dir, len(left), left)
+}
+
+func TestResetActorDirsCreatesBothTrees(t *testing.T) {
+	useTempNodeDirs(t)
+	const actorUID = "actor-uid-isolation"
+
+	if err := actordirs.ResetActorDirs(actorUID); err != nil {
+		t.Fatalf("ResetActorDirs(%q) failed: %v", actorUID, err)
+	}
+	for root, dirs := range map[string]map[string]string{
+		ateletpath.ActorSnapshotPath(actorUID): {
+			"CheckpointStateDir": ateletpath.CheckpointStateDir(actorUID),
+			"RestoreStateDir":    ateletpath.RestoreStateDir(actorUID),
+		},
+		ateletpath.ActorPath(actorUID): {
+			"OCIBundleDir":              ateletpath.OCIBundleDir(actorUID),
+			"DurableDirVolumeMountsDir": ateletpath.DurableDirVolumeMountsDir(actorUID),
+			"SystemInfoVolumeRootsDir":  ateletpath.SystemInfoVolumeRootsDir(actorUID),
+			"ExternalVolumeMountsDir":   ateletpath.ExternalVolumeMountsDir(actorUID),
+		},
+	} {
+		for name, dir := range dirs {
+			if rel, err := filepath.Rel(root, dir); err != nil || !filepath.IsLocal(rel) {
+				t.Errorf("%s = %q, want it under %q", name, dir, root)
+			}
+			if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+				t.Errorf("ResetActorDirs did not create %s (%q): err=%v", name, dir, err)
+			}
 		}
-		t.Errorf("actor dir %s survived removeActorDirs with %d entries: %v", actorDir, len(left), left)
-	} else if !os.IsNotExist(err) {
-		t.Errorf("reading actor dir %s: %v", actorDir, err)
+	}
+}
+
+func TestRemoveActorDirsKeepsActorDirWhenSnapshotTreeRemains(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so no snapshot can be made undeletable")
+	}
+	useTempNodeDirs(t)
+	const actorUID = "actor-uid-1"
+
+	if err := actordirs.ResetActorDirs(actorUID); err != nil {
+		t.Fatalf("ResetActorDirs(%q) failed: %v", actorUID, err)
+	}
+	record := ateletpath.ActorSandboxAssetsFile(actorUID)
+	if err := os.WriteFile(record, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A local snapshot dir with no write bit: its file cannot be unlinked.
+	stuck := ateletpath.LocalSnapshotDir(actorUID, "pause-stuck")
+	if err := os.MkdirAll(stuck, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stuck, "checkpoint.img"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stuck, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stuck, 0o700) })
+
+	if err := actordirs.RemoveActorDirs(actorUID); err == nil {
+		t.Fatal("RemoveActorDirs() = nil, want an error for the undeletable snapshot")
+	}
+	if _, err := os.Stat(record); err != nil {
+		t.Errorf("sandbox record %s is gone (err=%v), want it kept for a retried Terminate", record, err)
 	}
 }
 
 // TestRemoveActorDirsKeepsPopulatedVolume checks that removing the root does
-// not defeat the mount safety resetActorDirs provides: a volume directory with
-// contents means the unmount did not take, and deleting it would take the
-// mounted volume's data rather than the actor's.
+// not defeat the mount safety actordirs.ResetActorDirs provides: a volume
+// directory with contents means the unmount did not take, and deleting it would
+// take the mounted volume's data rather than the actor's.
 func TestRemoveActorDirsKeepsPopulatedVolume(t *testing.T) {
 	useTempNodeDirs(t)
 	const actorUID = "actor-uid-1"
 
-	stillMounted := filepath.Join(ateletpath.VolumeHostPath(actorUID, "data"), "payload")
+	stillMounted := filepath.Join(ateletpath.ExternalVolumeHostPath(actorUID, "data"), "payload")
 	if err := os.MkdirAll(filepath.Dir(stillMounted), 0o755); err != nil {
 		t.Fatalf("creating volume dir: %v", err)
 	}
@@ -1206,15 +1048,15 @@ func TestRemoveActorDirsKeepsPopulatedVolume(t *testing.T) {
 		t.Fatalf("writing volume contents: %v", err)
 	}
 
-	err := removeActorDirs(actorUID)
+	err := actordirs.RemoveActorDirs(actorUID)
 	if err == nil {
-		t.Fatal("removeActorDirs succeeded with a populated volume dir, want an error")
+		t.Fatal("RemoveActorDirs succeeded with a populated volume dir, want an error")
 	}
 	if strings.Contains(err.Error(), "%w") {
-		t.Errorf("removeActorDirs error %q has a literal %%w", err)
+		t.Errorf("RemoveActorDirs error %q has a literal %%w", err)
 	}
 	if _, err := os.Stat(stillMounted); err != nil {
-		t.Errorf("removeActorDirs deleted the contents of a volume that was still populated: %v", err)
+		t.Errorf("RemoveActorDirs deleted the contents of a volume that was still populated: %v", err)
 	}
 }
 
@@ -1224,8 +1066,8 @@ func TestResetDir(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := resetDir("state dir", dir, os.RemoveAll, 0o750); err != nil {
-			t.Fatalf("resetDir: %v", err)
+		if err := actordirs.ResetDir("state dir", dir, os.RemoveAll, 0o750); err != nil {
+			t.Fatalf("ResetDir: %v", err)
 		}
 		entries, err := os.ReadDir(dir)
 		if err != nil || len(entries) != 0 {
@@ -1238,9 +1080,9 @@ func TestResetDir(t *testing.T) {
 
 	t.Run("names the directory when the remove fails", func(t *testing.T) {
 		boom := errors.New("boom")
-		err := resetDir("state dir", t.TempDir(), func(string) error { return boom }, 0o700)
+		err := actordirs.ResetDir("state dir", t.TempDir(), func(string) error { return boom }, 0o700)
 		if !errors.Is(err, boom) {
-			t.Fatalf("resetDir = %v, want it to wrap %v", err, boom)
+			t.Fatalf("ResetDir = %v, want it to wrap %v", err, boom)
 		}
 		if got, want := err.Error(), "while deleting state dir: boom"; got != want {
 			t.Errorf("error = %q, want %q", got, want)
@@ -1252,9 +1094,9 @@ func TestResetDir(t *testing.T) {
 		if err := os.WriteFile(file, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		err := resetDir("state dir", filepath.Join(file, "child"), func(string) error { return nil }, 0o700)
+		err := actordirs.ResetDir("state dir", filepath.Join(file, "child"), func(string) error { return nil }, 0o700)
 		if err == nil || !strings.HasPrefix(err.Error(), "while creating state dir: ") {
-			t.Errorf("resetDir = %v, want an error starting %q", err, "while creating state dir: ")
+			t.Errorf("ResetDir = %v, want an error starting %q", err, "while creating state dir: ")
 		}
 		if err != nil && strings.Contains(err.Error(), "%w") {
 			t.Errorf("error %q has a literal %%w", err)
@@ -1403,12 +1245,12 @@ func TestDrainOnShutdownForceStopsAfterTimeout(t *testing.T) {
 }
 
 // Image volumes appear on their own ImageVolumeMounts field, separate from durable-dir mounts.
-func TestBuildAteomWorkloadSpec_ImageVolumeMounts(t *testing.T) {
+func TestBuildWorkerWorkloadSpec_ImageVolumeMounts(t *testing.T) {
 	spec := &ateletpb.WorkloadSpec{
 		Volumes: []*ateletpb.Volume{
-			{Name: "agent", Source: &ateletpb.Volume_Image{Image: &ateletpb.ImageVolumeSource{}}},
-			{Name: "data", Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}}},
-			{Name: "ext", Source: &ateletpb.Volume_External{External: &ateletpb.ExternalVolumeSource{}}},
+			{Name: "agent", Image: &ateletpb.ImageVolumeSource{}},
+			{Name: "data", DurableDir: &ateletpb.DurableDirVolumeSource{}},
+			{Name: "ext", External: &ateletpb.ExternalVolumeSource{}},
 		},
 		Containers: []*ateletpb.Container{{
 			Name: "app",
@@ -1420,9 +1262,9 @@ func TestBuildAteomWorkloadSpec_ImageVolumeMounts(t *testing.T) {
 		}},
 	}
 
-	got, err := buildAteomWorkloadSpec(spec, nil)
+	got, err := buildWorkerWorkloadSpec(spec, nil)
 	if err != nil {
-		t.Fatalf("buildAteomWorkloadSpec: %v", err)
+		t.Fatalf("buildWorkerWorkloadSpec: %v", err)
 	}
 	if len(got.GetContainers()) != 1 {
 		t.Fatalf("containers = %d, want 1", len(got.GetContainers()))
@@ -1432,10 +1274,10 @@ func TestBuildAteomWorkloadSpec_ImageVolumeMounts(t *testing.T) {
 	if len(ctr.GetImageVolumeMounts()) != 1 {
 		t.Fatalf("image volume mounts = %v, want 1", ctr.GetImageVolumeMounts())
 	}
-	if name, path := ctr.GetImageVolumeMounts()[0].GetVolumeName(), ctr.GetImageVolumeMounts()[0].GetMountPath(); name != "agent" || path != "/ate" {
+	if name, path := ctr.GetImageVolumeMounts()[0].GetName(), ctr.GetImageVolumeMounts()[0].GetMountPath(); name != "agent" || path != "/ate" {
 		t.Errorf("image volume mount = (%q, %q), want (agent, /ate)", name, path)
 	}
-	if len(ctr.GetDurableDirVolumeMounts()) != 1 || ctr.GetDurableDirVolumeMounts()[0].GetVolumeName() != "data" {
+	if len(ctr.GetDurableDirVolumeMounts()) != 1 || ctr.GetDurableDirVolumeMounts()[0].GetName() != "data" {
 		t.Errorf("durable mounts = %v, want just data", ctr.GetDurableDirVolumeMounts())
 	}
 }
@@ -1446,6 +1288,7 @@ type recordingObjectStorage struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	putErr  error
+	onPut   func()
 }
 
 func (r *recordingObjectStorage) GetObject(_ context.Context, bucket, object string) (io.ReadCloser, error) {
@@ -1459,6 +1302,9 @@ func (r *recordingObjectStorage) GetObject(_ context.Context, bucket, object str
 }
 
 func (r *recordingObjectStorage) PutObject(_ context.Context, bucket, object string, reader io.Reader) error {
+	if r.onPut != nil {
+		r.onPut()
+	}
 	if r.putErr != nil {
 		return r.putErr
 	}
@@ -1486,7 +1332,7 @@ func (r *recordingObjectStorage) keys() []string {
 	return keys
 }
 
-// writeLocalSnapshot lays a local pause snapshot out in dir: the given files
+// writeLocalSnapshot lays a node-local snapshot out in dir: the given files
 // plus the marshaled manifest beside them.
 func writeLocalSnapshot(t *testing.T, dir string, rec sandboxAssetsRecord, contents map[string]string) {
 	t.Helper()
@@ -1507,16 +1353,50 @@ func writeLocalSnapshot(t *testing.T, dir string, rec sandboxAssetsRecord, conte
 	}
 }
 
-func validUploadPausedCheckpointRequest() *ateletpb.UploadPausedCheckpointRequest {
-	return &ateletpb.UploadPausedCheckpointRequest{
-		Atespace:               "ate-demo",
-		ActorName:              "counter-1",
-		ActorUid:               "123e4567-e89b-12d3-a456-426614174000",
-		ActorTemplateAtespace:  "ate-demo",
-		ActorTemplateName:      "counter",
-		LocalSnapshotName:      "pause-snap-1",
-		DestinationSnapshotUri: pausedSnapshotURI,
-		DesiredFidelity:        ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+func immediateUploadConfig() *ateletpb.UploadConfig {
+	return &ateletpb.UploadConfig{
+		Mode: ateletpb.UploadMode_UPLOAD_MODE_IMMEDIATE,
+	}
+}
+
+func deferredUploadConfig() *ateletpb.UploadConfig {
+	return &ateletpb.UploadConfig{
+		Mode: ateletpb.UploadMode_UPLOAD_MODE_DEFERRED,
+	}
+}
+
+func validCheckpointRequest() *ateletpb.CheckpointRequest {
+	return &ateletpb.CheckpointRequest{
+		Atespace:              "ate-demo",
+		ActorName:             "counter-1",
+		ActorTemplateAtespace: "ate-demo",
+		ActorTemplateName:     "counter",
+		WorkerPodUid:          "422938ba-8860-4983-a25d-d6bcb0a69d4e",
+		ActorUid:              "123e4567-e89b-12d3-a456-426614174000",
+		Spec:                  &ateletpb.WorkloadSpec{Containers: []*ateletpb.Container{{Name: "worker"}}},
+		Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: "snap-1",
+			Generation:   1,
+			Fidelity:     ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			Object:       &ateletpb.ObjectStorage{SnapshotUri: testSnapshotURI},
+		},
+		UploadConfig: immediateUploadConfig(),
+	}
+}
+
+func validPromoteSnapshotRequest() *ateletpb.PromoteSnapshotRequest {
+	return &ateletpb.PromoteSnapshotRequest{
+		Atespace:              "ate-demo",
+		ActorName:             "counter-1",
+		ActorUid:              "123e4567-e89b-12d3-a456-426614174000",
+		ActorTemplateAtespace: "ate-demo",
+		ActorTemplateName:     "counter",
+		Snapshot: &ateletpb.Snapshot{
+			SnapshotUuid: "pause-snap-1",
+			Generation:   1,
+			Fidelity:     ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+			Object:       &ateletpb.ObjectStorage{SnapshotUri: pausedSnapshotURI},
+		},
 	}
 }
 
@@ -1529,7 +1409,6 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 	fullRec := func(class string) sandboxAssetsRecord {
 		return sandboxAssetsRecord{
 			SandboxClass:      class,
-			PauseImage:        testPauseImage,
 			SnapshotFiles:     []string{"config.json", "memory-ranges", "data.tar"},
 			DataSnapshotFiles: []string{"data.tar"},
 			Fidelity:          ateattr.SnapshotFidelityMemory,
@@ -1557,7 +1436,7 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 			"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
 		})
 
-		if _, err := s.uploadLocalCheckpointDir(ctx, validUploadPausedCheckpointRequest(), dir, uri); err != nil {
+		if _, _, err := s.uploadLocalCheckpointDir(ctx, validPromoteSnapshotRequest(), dir, uri); err != nil {
 			t.Fatalf("uploadLocalCheckpointDir: %v", err)
 		}
 		want := []string{
@@ -1580,15 +1459,14 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		dir := filepath.Join(t.TempDir(), "pause-snap-1")
 		writeLocalSnapshot(t, dir, sandboxAssetsRecord{
 			SandboxClass:      "microvm",
-			PauseImage:        testPauseImage,
 			SnapshotFiles:     []string{"rootfs-upper-app.tar", "data.tar"},
 			DataSnapshotFiles: []string{"data.tar"},
 			Fidelity:          ateattr.SnapshotFidelityRootfs,
 		}, map[string]string{"rootfs-upper-app.tar": "upper", "data.tar": "data"})
 
-		req := validUploadPausedCheckpointRequest()
-		req.DesiredFidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
-		if _, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri); err != nil {
+		req := validPromoteSnapshotRequest()
+		req.Snapshot.Fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
+		if _, _, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri); err != nil {
 			t.Fatalf("uploadLocalCheckpointDir: %v", err)
 		}
 		want := []string{
@@ -1626,9 +1504,9 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 				"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
 			})
 
-			req := validUploadPausedCheckpointRequest()
-			req.DesiredFidelity = tc.desired
-			_, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri)
+			req := validPromoteSnapshotRequest()
+			req.Snapshot.Fidelity = tc.desired
+			_, _, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri)
 			if got := apierror.Code(err); got != codes.FailedPrecondition {
 				t.Fatalf("status.Code = %v (err %v), want FailedPrecondition", got, err)
 			}
@@ -1644,13 +1522,12 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		dir := filepath.Join(t.TempDir(), "pause-snap-1")
 		writeLocalSnapshot(t, dir, sandboxAssetsRecord{
 			SandboxClass:  "microvm",
-			PauseImage:    testPauseImage,
 			SnapshotFiles: []string{"data.tar"},
 		}, map[string]string{"data.tar": "data"})
 
-		req := validUploadPausedCheckpointRequest()
-		req.DesiredFidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
-		_, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri)
+		req := validPromoteSnapshotRequest()
+		req.Snapshot.Fidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+		_, _, err := s.uploadLocalCheckpointDir(ctx, req, dir, uri)
 		if got := apierror.Code(err); got != codes.FailedPrecondition {
 			t.Fatalf("status.Code = %v (err %v), want FailedPrecondition for a scope-less manifest", got, err)
 		}
@@ -1665,17 +1542,20 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 		}}
 		s := newPluginHerder(t, store)
 
-		if _, err := s.uploadLocalCheckpointDir(ctx, validUploadPausedCheckpointRequest(), filepath.Join(t.TempDir(), "never-created"), uri); err != nil {
+		if _, _, err := s.uploadLocalCheckpointDir(ctx, validPromoteSnapshotRequest(), filepath.Join(t.TempDir(), "never-created"), uri); err != nil {
 			t.Fatalf("uploadLocalCheckpointDir: %v", err)
 		}
 	})
 
-	t.Run("gone locally and remotely crashes the actor", func(t *testing.T) {
+	t.Run("gone locally and remotely is NotFound", func(t *testing.T) {
 		s := newPluginHerder(t, &recordingObjectStorage{})
 
-		_, err := s.uploadLocalCheckpointDir(ctx, validUploadPausedCheckpointRequest(), filepath.Join(t.TempDir(), "never-created"), uri)
-		if err == nil {
-			t.Fatal("uploadLocalCheckpointDir succeeded, want error")
+		_, _, err := s.uploadLocalCheckpointDir(ctx, validPromoteSnapshotRequest(), filepath.Join(t.TempDir(), "never-created"), uri)
+		// atelet's server interceptor decides the code ate-api-server sees.
+		_, wireErr := ateinterceptors.InternalServerUnaryInterceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/test"},
+			func(context.Context, any) (any, error) { return nil, err })
+		if got := status.Code(wireErr); got != codes.NotFound {
+			t.Fatalf("code = %v (err %v), want NotFound", got, wireErr)
 		}
 		if !strings.Contains(err.Error(), "gone and no uploaded copy exists") {
 			t.Errorf("error = %v, want it to name the unrecoverable local snapshot", err)
@@ -1689,52 +1569,59 @@ func TestUploadLocalCheckpointDir(t *testing.T) {
 			"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
 		})
 
-		_, err := s.uploadLocalCheckpointDir(ctx, validUploadPausedCheckpointRequest(), dir, uri)
+		_, _, err := s.uploadLocalCheckpointDir(ctx, validPromoteSnapshotRequest(), dir, uri)
 		if err == nil {
 			t.Fatal("uploadLocalCheckpointDir succeeded, want error")
 		}
 	})
-}
 
-func TestValidateUploadPausedCheckpointRequest(t *testing.T) {
-	tests := []struct {
-		name    string
-		mutate  func(*ateletpb.UploadPausedCheckpointRequest)
-		wantErr bool
-	}{
-		{"valid", func(*ateletpb.UploadPausedCheckpointRequest) {}, false},
-		{"valid volumes fidelity", func(r *ateletpb.UploadPausedCheckpointRequest) {
-			r.DesiredFidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
-		}, false},
-		{"valid rootfs fidelity", func(r *ateletpb.UploadPausedCheckpointRequest) {
-			r.DesiredFidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS
-		}, false},
-		{"invalid atespace", func(r *ateletpb.UploadPausedCheckpointRequest) { r.Atespace = "../escape" }, true},
-		{"golden atespace rejected", func(r *ateletpb.UploadPausedCheckpointRequest) { r.Atespace = resources.GoldenActorAtespace }, true},
-		{"invalid actor name", func(r *ateletpb.UploadPausedCheckpointRequest) { r.ActorName = "UPPER" }, true},
-		{"invalid actor uid", func(r *ateletpb.UploadPausedCheckpointRequest) { r.ActorUid = "" }, true},
-		{"any actor template identity accepted", func(r *ateletpb.UploadPausedCheckpointRequest) { r.ActorTemplateAtespace = "no/slashes" }, false},
-		{"empty actor template identity accepted", func(r *ateletpb.UploadPausedCheckpointRequest) {
-			r.ActorTemplateAtespace, r.ActorTemplateName = "", ""
-		}, false},
-		{"invalid snapshot name", func(r *ateletpb.UploadPausedCheckpointRequest) { r.LocalSnapshotName = "../escape" }, true},
-		{"invalid snapshot uri", func(r *ateletpb.UploadPausedCheckpointRequest) { r.DestinationSnapshotUri = "not-a-uri" }, true},
-		{"unspecified fidelity", func(r *ateletpb.UploadPausedCheckpointRequest) {
-			r.DesiredFidelity = ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_UNSPECIFIED
-		}, true},
-		{"invalid fidelity", func(r *ateletpb.UploadPausedCheckpointRequest) {
-			r.DesiredFidelity = ateletpb.SnapshotFidelity(23)
-		}, true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			req := validUploadPausedCheckpointRequest()
-			tc.mutate(req)
-			if err := validateUploadPausedCheckpointRequest(req); (err != nil) != tc.wantErr {
-				t.Errorf("validateUploadPausedCheckpointRequest err = %v, wantErr %v", err, tc.wantErr)
-			}
+	t.Run("earlier boot already uploaded skips upload", func(t *testing.T) {
+		store := &recordingObjectStorage{
+			objects: map[string][]byte{
+				pausedSnapshotPath + "/manifest.json": []byte(`{"sandboxClass":"microvm"}`),
+			},
+			putErr: errors.New("must not upload a local copy from before the node rebooted"),
+		}
+		s := newPluginHerder(t, store)
+		s.bootID = "boot-2"
+		dir := filepath.Join(t.TempDir(), "pause-snap-1")
+		rec := fullRec("microvm")
+		rec.BootID = "boot-1"
+		writeLocalSnapshot(t, dir, rec, map[string]string{
+			"config.json": "cfg", "memory-ranges": "", "data.tar": "data",
 		})
-	}
+
+		_, uploaded, err := s.uploadLocalCheckpointDir(ctx, validPromoteSnapshotRequest(), dir, uri)
+		if err != nil {
+			t.Fatalf("uploadLocalCheckpointDir: %v", err)
+		}
+		if uploaded {
+			t.Error("uploaded = true, want false when the remote manifest already exists")
+		}
+	})
+
+	t.Run("earlier boot not uploaded is NotFound", func(t *testing.T) {
+		store := &recordingObjectStorage{}
+		s := newPluginHerder(t, store)
+		s.bootID = "boot-2"
+		dir := filepath.Join(t.TempDir(), "pause-snap-1")
+		rec := fullRec("microvm")
+		rec.BootID = "boot-1"
+		writeLocalSnapshot(t, dir, rec, map[string]string{
+			"config.json": "cfg", "memory-ranges": "mem", "data.tar": "data",
+		})
+
+		_, uploaded, err := s.uploadLocalCheckpointDir(ctx, validPromoteSnapshotRequest(), dir, uri)
+		if uploaded {
+			t.Error("uploaded = true, want false")
+		}
+		if got := apierror.Code(err); got != codes.NotFound {
+			t.Fatalf("code = %v (err %v), want NotFound", got, err)
+		}
+		if len(store.keys()) != 0 {
+			t.Errorf("objects uploaded for a local copy from before the node rebooted: %v", store.keys())
+		}
+	})
 }
 
 func TestShouldHaveSnapshots(t *testing.T) {
@@ -1746,24 +1633,24 @@ func TestShouldHaveSnapshots(t *testing.T) {
 		{
 			name: "full scope always expects snapshots",
 			req: &ateletpb.CheckpointRequest{
-				Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY,
+				Snapshot: &ateletpb.Snapshot{Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY},
 			},
 			want: true,
 		},
 		{
 			name: "rootfs fidelity always expects snapshots",
 			req: &ateletpb.CheckpointRequest{
-				Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS,
+				Snapshot: &ateletpb.Snapshot{Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS},
 			},
 			want: true,
 		},
 		{
 			name: "data scope with durable volumes expects snapshots",
 			req: &ateletpb.CheckpointRequest{
-				Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+				Snapshot: &ateletpb.Snapshot{Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES},
 				Spec: &ateletpb.WorkloadSpec{
 					Volumes: []*ateletpb.Volume{
-						{Name: "durable", Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}}},
+						{Name: "durable", DurableDir: &ateletpb.DurableDirVolumeSource{}},
 					},
 				},
 			},
@@ -1772,10 +1659,10 @@ func TestShouldHaveSnapshots(t *testing.T) {
 		{
 			name: "data scope with only CSI volumes does not expect snapshots",
 			req: &ateletpb.CheckpointRequest{
-				Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+				Snapshot: &ateletpb.Snapshot{Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES},
 				Spec: &ateletpb.WorkloadSpec{
 					Volumes: []*ateletpb.Volume{
-						{Name: "csi", Source: &ateletpb.Volume_External{External: &ateletpb.ExternalVolumeSource{}}},
+						{Name: "csi", External: &ateletpb.ExternalVolumeSource{}},
 					},
 				},
 			},
@@ -1784,11 +1671,11 @@ func TestShouldHaveSnapshots(t *testing.T) {
 		{
 			name: "data scope with both durable and CSI volumes expects snapshots",
 			req: &ateletpb.CheckpointRequest{
-				Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+				Snapshot: &ateletpb.Snapshot{Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES},
 				Spec: &ateletpb.WorkloadSpec{
 					Volumes: []*ateletpb.Volume{
-						{Name: "durable", Source: &ateletpb.Volume_DurableDir{DurableDir: &ateletpb.DurableDirVolume{}}},
-						{Name: "csi", Source: &ateletpb.Volume_External{External: &ateletpb.ExternalVolumeSource{}}},
+						{Name: "durable", DurableDir: &ateletpb.DurableDirVolumeSource{}},
+						{Name: "csi", External: &ateletpb.ExternalVolumeSource{}},
 					},
 				},
 			},
@@ -1797,7 +1684,7 @@ func TestShouldHaveSnapshots(t *testing.T) {
 		{
 			name: "data scope with no volumes does not expect snapshots",
 			req: &ateletpb.CheckpointRequest{
-				Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+				Snapshot: &ateletpb.Snapshot{Fidelity: ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES},
 				Spec:     &ateletpb.WorkloadSpec{},
 			},
 			want: false,
@@ -1808,6 +1695,44 @@ func TestShouldHaveSnapshots(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := shouldHaveSnapshots(tc.req); got != tc.want {
 				t.Errorf("shouldHaveSnapshots() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServingCheck pins the readiness contract at startup: /readyz holds
+// 503 until main has opened the gRPC port, whatever else is already up.
+func TestServingCheck(t *testing.T) {
+	served := make(chan struct{})
+	check := servingCheck(served)
+	if err := check(context.Background()); err == nil {
+		t.Error("servingCheck passed before the port was opened")
+	}
+	close(served)
+	if err := check(context.Background()); err != nil {
+		t.Errorf("servingCheck after the port opened = %v, want nil", err)
+	}
+}
+
+// A worker that is unavailable, whether refusing workloads until it registers
+// or unreachable after a restart, reaches atelet's caller as Unavailable so the
+// resume or suspend is retried. Any other worker failure is Internal.
+func TestWorkerCallError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want codes.Code
+	}{
+		{name: "worker refuses", err: status.Error(codes.Unavailable, "worker has not registered yet"), want: codes.Unavailable},
+		{name: "worker unreachable", err: fmt.Errorf("dial: %w", status.Error(codes.Unavailable, "connection refused")), want: codes.Unavailable},
+		{name: "worker fails", err: status.Error(codes.Internal, "sandbox would not start"), want: codes.Internal},
+		{name: "worker canceled", err: status.Error(codes.Canceled, "gave up waiting for the actor's lock: context canceled"), want: codes.Internal},
+		{name: "worker deadline exceeded", err: status.Error(codes.DeadlineExceeded, "gave up waiting for the actor's lock: context deadline exceeded"), want: codes.Internal},
+		{name: "plain error", err: errors.New("boom"), want: codes.Internal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := apierror.Code(workerCallError("RestoreWorkload", tc.err)); got != tc.want {
+				t.Errorf("workerCallError() code = %v, want %v", got, tc.want)
 			}
 		})
 	}

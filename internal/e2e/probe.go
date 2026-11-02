@@ -16,9 +16,10 @@ package e2e
 
 import (
 	"context"
+	"slices"
 	"testing"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"go.ate.dev/substrate/api/ateapi/v1"
 )
 
 // ProbeName is the name of the probe fixture's WorkerPool and ActorTemplate,
@@ -35,7 +36,13 @@ var probeManifests = SubstrateFixtureManifests{
 // ProbeOption adjusts what DeployProbe installs.
 type ProbeOption func(*probeConfig)
 
-type probeConfig struct{ trustBundle bool }
+type probeConfig struct{ trustBundles []string }
+
+// The allowlisted names atelet resolves trust bundles by.
+const (
+	EgressTrustBundleName = "egress-mitm.ate.dev"
+	systemRootsBundleName = "system-roots.ate.dev"
+)
 
 // WithTrustBundle projects the egress trust bundle into the probe's
 // system-info volume, ensuring the cluster-scoped bundle exists first.
@@ -43,7 +50,16 @@ type probeConfig struct{ trustBundle bool }
 // Only suites that test the bundle should ask for it. An actor whose template
 // includes the bundle won't start if the bundle is missing, so a suite that
 // just needs a probe shouldn't depend on it.
-func WithTrustBundle() ProbeOption { return func(c *probeConfig) { c.trustBundle = true } }
+func WithTrustBundle() ProbeOption {
+	return func(c *probeConfig) { c.trustBundles = append(c.trustBundles, EgressTrustBundleName) }
+}
+
+// WithSystemRoots adds the WebPKI roots atelet ships to the probe's projected
+// trust file, as the egress demo's template combines them with the egress
+// trust bundle.
+func WithSystemRoots() ProbeOption {
+	return func(c *probeConfig) { c.trustBundles = append(c.trustBundles, systemRootsBundleName) }
+}
 
 // DeployProbe builds the probe fixture image and installs the fixture for the
 // sandbox class under test, removing it when the test ends. name
@@ -52,19 +68,19 @@ func WithTrustBundle() ProbeOption { return func(c *probeConfig) { c.trustBundle
 // out from under another running concurrently. It returns the fixture's
 // atespace (which also names the k8s namespace holding the pool) and the
 // created ActorTemplate, already golden-snapshotted.
-func DeployProbe(t *testing.T, bucket, name string, opts ...ProbeOption) (string, *ateapipb.ActorTemplate) {
+func DeployProbe(t *testing.T, name string, opts ...ProbeOption) (string, *ateapi.ActorTemplate) {
 	t.Helper()
 
 	var cfg probeConfig
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	if cfg.trustBundle {
+	if slices.Contains(cfg.trustBundles, EgressTrustBundleName) {
 		// Every actor from this template — the fixture's golden boot included —
 		// fails closed while the bundle is missing, so it has to exist first.
 		EnsureEgressTrustBundle(t, context.Background(), GetClients())
 	}
 
-	atespace, templates := DeploySubstrateFixture(t, context.Background(), GetClients(), probeManifests, bucket, name, cfg.trustBundle)
+	atespace, templates := DeploySubstrateFixture(t, context.Background(), GetClients(), probeManifests, name, cfg.trustBundles)
 	return atespace, templates[0]
 }

@@ -46,10 +46,16 @@ from typing import IO, Any, TextIO
 from cluster_facts import (
     EMPTY_FACTS,
     append_trial_summary,
+    diff_worker_pods,
     get_cluster_hardware_facts,
+    read_evicted_pods,
+    snapshot_worker_pods,
 )
 from common.boomer_config import build_config_json
 from server_telemetry import extract_and_record_server_telemetry
+from phase_breakdown import append_phase_breakdown
+from ladder_steps import append_ladder_steps
+from turnover_window import append_turnover_window, fill_done_ts
 
 # Path inside the locust image to the boomer-worker binary baked in by
 # benchmarking/locust/Dockerfile.
@@ -77,6 +83,17 @@ PY_TRACE_RE = re.compile(
     r"duration_ms=(?P<duration>[0-9.]+)\s+"
     r"\((?P<source>\w+)\)"
 )
+
+
+def json_object(value: str) -> dict[str, Any]:
+    """argparse type for --metadata: a JSON object, checked before the run."""
+    try:
+        obj = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return obj
 
 
 def parse_args() -> argparse.Namespace:
@@ -142,8 +159,18 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help=(
             "Read node capacity and worker pod count from the Kubernetes API "
-            "after the run to derive density frontiers. Pass "
+            "after the run to derive density frontiers, and worker pod restarts "
+            "and evictions around it for oom_events. Pass "
             "--no-cluster-facts to skip Kubernetes API discovery"
+        ),
+    )
+    p.add_argument(
+        "--metadata",
+        type=json_object,
+        default={},
+        help=(
+            "Free-form JSON object describing the run, such as where it ran. "
+            "Each key is recorded in trial_summary as metadata_<key>"
         ),
     )
     p.add_argument(
@@ -160,10 +187,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=70,
         help=(
-            "Seconds to wait after the run, and to shift the snapshot window "
-            "by, so the atelet's last export is scraped. Must cover the "
-            "atelet's OTEL_METRIC_EXPORT_INTERVAL plus one Prometheus scrape; "
-            "the default fits the OTel SDK's 60s default export and a 10s scrape"
+            "Seconds to wait after the run, so the atelet's last export is "
+            "scraped; its snapshot and active actor windows are read half this "
+            "late. Must cover the atelet's OTEL_METRIC_EXPORT_INTERVAL plus one "
+            "Prometheus scrape; the default fits the OTel SDK's 60s default export "
+            "and a 10s scrape"
+        ),
+    )
+    p.add_argument(
+        "--phase-breakdown",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Read the atelet and worker pod logs after the run and append the "
+            "suspend/resume phase percentiles to stats.jsonl (see "
+            "benchmarking/analysis/README.md). Pass --no-phase-breakdown to "
+            "skip reading pod logs"
         ),
     )
     args, extra = p.parse_known_args()
@@ -332,6 +371,10 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
         "-t", args.duration,
         "-u", str(args.users),
         "--csv", str(csv_prefix),
+        # Every operation's row in stats_history.csv, not just Aggregated, so
+        # each one's latency can be charted over the run. Readers of the file
+        # here keep to the Aggregated rows.
+        "--csv-full-history",
     ]
     if with_boomer:
         # Master mode so boomer can connect as a worker on localhost:5557.
@@ -473,11 +516,37 @@ def upload(src: Path, dest: str) -> None:
 def collect_cluster_facts(
     args: argparse.Namespace, logs: TextIO
 ) -> dict[str, Any]:
-    """Returns cluster hardware facts, or empty facts when discovery is off."""
+    """Returns cluster facts, or empty facts when discovery is off."""
     if not args.cluster_facts:
         tee(logs, "Skipping cluster hardware discovery (--no-cluster-facts)")
         return dict(EMPTY_FACTS)
     return get_cluster_hardware_facts(logs)
+
+
+def read_worker_pods(
+    args: argparse.Namespace, logs: TextIO
+) -> dict[str, dict[str, Any]] | None:
+    """Worker pod state, or None when discovery is off or the read fails."""
+    if not args.cluster_facts:
+        return None
+    try:
+        return snapshot_worker_pods(logs)
+    except Exception as e:
+        tee(logs, f"Warning: Failed to read worker pods: {e}")
+        return None
+
+
+def read_evictions(
+    args: argparse.Namespace, since_ts: int, logs: TextIO
+) -> set[str] | None:
+    """Pods evicted since since_ts, or None when discovery is off or it fails."""
+    if not args.cluster_facts:
+        return None
+    try:
+        return read_evicted_pods(since_ts, logs)
+    except Exception as e:
+        tee(logs, f"Warning: Failed to read evictions: {e}")
+        return None
 
 
 def main() -> None:
@@ -510,8 +579,13 @@ def main() -> None:
         traces.write("\t".join(TRACE_COLUMNS) + "\n")
         traces.flush()
         log_run_config(args, prefix, work_dir, logs)
+        # Worker pods around the run, for OOMKilled restarts and evictions.
+        pods_before = read_worker_pods(args, logs)
         exit_code = run_test(args, csv_prefix, logs, traces)
         run_end_ts = int(datetime.now(timezone.utc).timestamp())
+        pods_after = read_worker_pods(args, logs)
+        # Right after the run, as Evicted events expire after about 1h.
+        evicted_uids = read_evictions(args, run_ts, logs)
 
         stats_generated = False
         if stats_csv.exists():
@@ -559,9 +633,23 @@ def main() -> None:
                     data_ts,
                     facts,
                     logs,
+                    run_start=run_ts,
+                    run_end=run_end_ts,
                 )
             except Exception as e:
                 tee(logs, f"Warning: Failed to record cluster facts: {e}")
+
+        # A turnover run is measured from the end of its fill, past the
+        # registration of its fleet: the server telemetry's steady window and
+        # the turnover_window row start there. Other runs have no such line.
+        turnover_start = None
+        try:
+            with open(logs_path, errors="replace") as f:
+                turnover_start = fill_done_ts(f)
+            if turnover_start is not None:
+                tee(logs, f"Turnover fill done at {turnover_start}; measuring the turnover from there")
+        except Exception as e:
+            tee(logs, f"Warning: Failed to read the turnover start: {e}")
 
         # Server telemetry is a Prometheus time-window query, so it runs
         # either way. A run too loaded to write a CSV is the one its
@@ -579,9 +667,54 @@ def main() -> None:
                 test_name=args.name,
                 logs=logs,
                 lag_s=args.atelet_lag_s,
+                worker_pods=diff_worker_pods(pods_before, pods_after, evicted_uids),
+                steady_not_before=turnover_start,
             )
         except Exception as e:
             tee(logs, f"Warning: Failed to harvest server telemetry: {e}")
+
+        # Per-step rows for a ladder run, from the same Prometheus. Placed
+        # after the server telemetry, whose wait lets the last step's samples
+        # be scraped.
+        try:
+            n = append_ladder_steps(
+                jsonl_path, logs_path, args.prometheus_url, data_ts,
+                args.tag, args.name, logs,
+            )
+            if n:
+                tee(logs, f"Appended {n} ladder step rows to {jsonl_path}")
+        except Exception as e:
+            tee(logs, f"Warning: Failed to summarize ladder steps: {e}")
+
+        if turnover_start is not None:
+            try:
+                if append_turnover_window(
+                    jsonl_path, turnover_start, stats_history_csv, data_ts,
+                    args.tag, args.name, logs,
+                ):
+                    tee(logs, f"Appended the turnover_window row to {jsonl_path}")
+            except Exception as e:
+                tee(logs, f"Warning: Failed to summarize the turnover window: {e}")
+
+        # The phase breakdown is additive too. It reads the node logs now,
+        # while the pods still exist: the orchestrator deletes them as soon
+        # as this process exits. The window reaches back to this run's start
+        # with a margin for the clocks involved.
+        if stats_generated and args.phase_breakdown:
+            try:
+                append_phase_breakdown(
+                    jsonl_path,
+                    stats_csv,
+                    int(time.time() - now.timestamp()) + 60,
+                    data_ts,
+                    args.tag,
+                    args.name,
+                    logs,
+                )
+            except Exception as e:
+                tee(logs, f"Warning: Failed to record phase breakdown: {e}")
+        elif stats_generated:
+            tee(logs, "Skipping phase breakdown (--no-phase-breakdown)")
 
     status_path.write_text(
         json.dumps(
@@ -599,8 +732,6 @@ def main() -> None:
         (work_dir / f"{args.name}_failures.csv", "failures.csv"),
         (work_dir / f"{args.name}_stats_history.csv", "stats_history.csv"),
         (server_summary_json, "server_summary.json"),
-        # TODO: remove after data migration
-        (jsonl_path, f"{args.name}.jsonl"),
     ]
     for src, basename in files:
         if not src.exists():

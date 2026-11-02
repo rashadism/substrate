@@ -26,15 +26,20 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -79,6 +84,7 @@ type capabilitiesResponse struct {
 	Permitted   []string `json:"permitted"`
 	Inheritable []string `json:"inheritable"`
 	Ambient     []string `json:"ambient"`
+	NoNewPrivs  bool     `json:"noNewPrivs"`
 	// Error carries a read/parse failure so a failing assertion explains itself
 	// instead of just showing empty sets.
 	Error string `json:"error,omitempty"`
@@ -127,6 +133,10 @@ func readProcCapabilities() (*capabilitiesResponse, error) {
 	for scanner.Scan() {
 		key, value, found := strings.Cut(scanner.Text(), "\t")
 		if !found {
+			continue
+		}
+		if key == "NoNewPrivs:" {
+			out.NoNewPrivs = strings.TrimSpace(value) == "1"
 			continue
 		}
 		dst, ok := targets[strings.TrimSpace(key)]
@@ -213,6 +223,36 @@ func readfile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, resp)
 }
 
+// statResponse is the /stat payload: path's numeric owner and mode as the
+// actor sees them, without following a final-component symlink.
+type statResponse struct {
+	Path string `json:"path"`
+	UID  uint32 `json:"uid"`
+	GID  uint32 `json:"gid"`
+	// Mode is the os.FileMode string, e.g. "drwx------".
+	Mode  string `json:"mode"`
+	Error string `json:"error,omitempty"`
+}
+
+// stat reports a path's owner and mode inside the actor, so a test can assert
+// on the ownership the image's layers gave it.
+func stat(w http.ResponseWriter, r *http.Request) {
+	resp := statResponse{Path: r.URL.Query().Get("path")}
+	fi, err := os.Lstat(resp.Path)
+	if err != nil {
+		resp.Error = err.Error()
+		writeJSON(w, resp)
+		return
+	}
+	resp.Mode = fi.Mode().String()
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		resp.UID, resp.GID = st.Uid, st.Gid
+	} else {
+		resp.Error = "no owner information for " + resp.Path
+	}
+	writeJSON(w, resp)
+}
+
 func writefile(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
 	resp := map[string]string{"path": path}
@@ -220,6 +260,19 @@ func writefile(w http.ResponseWriter, r *http.Request) {
 		resp["error"] = err.Error()
 	} else {
 		resp["ok"] = "true"
+	}
+	writeJSON(w, resp)
+}
+
+// lookup resolves ?host= with the Go resolver, which reads /etc/hosts before
+// asking DNS, so a test can assert on the names the sandbox resolves locally.
+func lookup(w http.ResponseWriter, r *http.Request) {
+	host := r.URL.Query().Get("host")
+	resp := map[string]any{"host": host}
+	if addrs, err := net.DefaultResolver.LookupHost(r.Context(), host); err == nil {
+		resp["addrs"] = addrs
+	} else {
+		resp["error"] = err.Error()
 	}
 	writeJSON(w, resp)
 }
@@ -318,10 +371,12 @@ func parseFetchHeaders(params []string) (http.Header, error) {
 // path. Parameters to the fetch are passed as URL query parameters:
 //
 //   - url=<URL to fetch>: required.
-//   - roots=bundle|system: the TLS trust anchors. "bundle" (the default)
+//   - roots=bundle|system|pem: the TLS trust anchors. "bundle" (the default)
 //     loads the projected trust bundle at trustFile; "system" uses the
-//     image's system roots. TestActorEgressMITMTrust documents why each mode
-//     passes or fails.
+//     image's system roots; "pem" trusts only the certificates in ca.
+//     TestActorEgressMITMTrust documents why each mode passes or fails.
+//   - ca=<PEM>: the certificates roots=pem trusts. Required by roots=pem and
+//     rejected with any other mode.
 //   - header=<name>:<value>: repeatable; set on the request, so a suite can
 //     pre-seed a header and observe whether the gateway overwrites it.
 //   - dial=<host:port>: connect to this address instead of the URL's host,
@@ -334,6 +389,7 @@ func parseFetchHeaders(params []string) (http.Header, error) {
 // injected credential echoed back by a headers-echo endpoint). Failures land
 // in "error" rather than the HTTP status: a TLS verification failure is a
 // result for the suite to assert on, not a broken probe.
+// "tls_handshake" reports "complete", "closed", or "failed" when TLS was tried.
 //
 // Redirects are not followed — a cross-scheme redirect would silently hop
 // between the gateway's cleartext and TLS legs, flipping the very behavior
@@ -352,12 +408,20 @@ func fetch(w http.ResponseWriter, r *http.Request) {
 	}
 	roots := r.URL.Query().Get("roots")
 	switch roots {
-	case "", "bundle", "system":
+	case "", "bundle", "system", "pem":
 	default:
 		// Fail closed on typos: silently treating an unknown value as
 		// "bundle" would flip a suite's negative control into a positive
 		// fetch with a misleading failure message.
-		resp["error"] = "unknown roots value " + strconv.Quote(roots) + " (want bundle or system)"
+		resp["error"] = "unknown roots value " + strconv.Quote(roots) + " (want bundle, system or pem)"
+		writeJSON(w, resp)
+		return
+	}
+	// The same fail-closed reasoning: a ca the fetch would ignore, or a
+	// roots=pem with nothing to trust, is a suite bug, not a result.
+	ca := r.URL.Query().Get("ca")
+	if (roots == "pem") != (ca != "") {
+		resp["error"] = "the ca parameter goes with roots=pem, and roots=pem needs it"
 		writeJSON(w, resp)
 		return
 	}
@@ -376,7 +440,17 @@ func fetch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	tlsCfg := &tls.Config{}
-	if roots != "system" {
+	switch roots {
+	case "system":
+	case "pem":
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(ca)) {
+			resp["error"] = "no certificates parsed from the ca parameter"
+			writeJSON(w, resp)
+			return
+		}
+		tlsCfg.RootCAs = pool
+	default:
 		b, err := os.ReadFile(trustFile)
 		if err != nil {
 			resp["error"] = "reading trust bundle: " + err.Error()
@@ -416,7 +490,24 @@ func fetch(w http.ResponseWriter, r *http.Request) {
 	for name, values := range headers {
 		req.Header[name] = values
 	}
+	var handshake atomic.Value
+	// An HTTP failure alone can pass a denial test because of an unrelated
+	// certificate error or a close after TLS. Report handshake closure separately.
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			result := "complete"
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) {
+				result = "closed"
+			} else if err != nil {
+				result = "failed"
+			}
+			handshake.Store(result)
+		},
+	}))
 	res, err := client.Do(req)
+	if result, ok := handshake.Load().(string); ok {
+		resp["tls_handshake"] = result
+	}
 	if err != nil {
 		resp["error"] = err.Error()
 		writeJSON(w, resp)
@@ -439,7 +530,127 @@ func writeJSON(w http.ResponseWriter, v any) {
 	}
 }
 
+// bootFetchURLEnv names a URL the probe must fetch, through the egress gateway
+// and with the projected trust bundle, before it listens. A probe that cannot
+// fetch it exits and never answers its wakeup probe, so a golden snapshot of
+// it proves the actor had egress while it booted.
+const bootFetchURLEnv = "PROBE_BOOT_FETCH_URL"
+
+// bootFetchTimeout bounds the boot fetch, inside the template's wakeupProbe
+// timeout.
+const bootFetchTimeout = 30 * time.Second
+
+// bootFetch GETs url once, trusting only trustBundle, and fails unless it
+// answers 200. It does not retry: the actor's EgressPolicy exists before the
+// actor resumes, so a failure is the finding.
+func bootFetch(ctx context.Context, url, trustBundle string) error {
+	b, err := os.ReadFile(trustBundle)
+	if err != nil {
+		return fmt.Errorf("reading trust bundle: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(b) {
+		return fmt.Errorf("no certificates parsed from %s", trustBundle)
+	}
+	client := &http.Client{
+		Timeout:   bootFetchTimeout,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+	}
+	defer client.CloseIdleConnections()
+	if err := fetchOnce(ctx, client, url); err != nil {
+		return fmt.Errorf("boot fetch of %s: %w", url, err)
+	}
+	return nil
+}
+
+// restoreFetch answers the wakeup probe once the actor named in its identity
+// file has fetched url. A restore from the golden snapshot resumes past main's
+// boot fetch with the restored actor's identity, so its wakeup probe passes
+// only if the restored actor reaches url too. The prober times out each request
+// after wakeupprobe.RequestTimeout, so the fetch runs in the background while
+// /healthz answers 503.
+type restoreFetch struct {
+	url, identityFile, trustBundle string
+
+	mu       sync.Mutex
+	fetched  string
+	fetching string
+}
+
+func (f *restoreFetch) healthz(w http.ResponseWriter, _ *http.Request) {
+	b, err := os.ReadFile(f.identityFile)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	id := string(b)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if id == f.fetched {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if f.fetching != id {
+		f.fetching = id
+		go f.fetch(id)
+	}
+	http.Error(w, "fetching "+f.url+" as "+id, http.StatusServiceUnavailable)
+}
+
+func (f *restoreFetch) fetch(id string) {
+	err := bootFetch(context.Background(), f.url, f.trustBundle)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fetching == id {
+		f.fetching = ""
+	}
+	if err != nil {
+		log.Printf("probe: restore fetch as %s: %v", id, err)
+		return
+	}
+	log.Printf("probe: restore fetch of %s as %s succeeded", f.url, id)
+	f.fetched = id
+}
+
+func fetchOnce(ctx context.Context, client *http.Client, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, maxFetchBody))
+	if res.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", res.StatusCode)
+	}
+	return nil
+}
+
 func main() {
+	if len(os.Args) == 4 && os.Args[1] == "filesystem-child" {
+		if err := filesystemChild(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	healthz := func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }
+	if url := os.Getenv(bootFetchURLEnv); url != "" {
+		booted, err := os.ReadFile(identityFile)
+		if err != nil {
+			log.Fatalf("probe: reading %s: %v", identityFile, err)
+		}
+		if err := bootFetch(context.Background(), url, trustFile); err != nil {
+			log.Fatalf("probe: %v", err)
+		}
+		log.Printf("probe: boot fetch of %s succeeded", url)
+		f := &restoreFetch{url: url, identityFile: identityFile, trustBundle: trustFile, fetched: string(booted)}
+		healthz = f.healthz
+	}
+
 	// Hold the identity file open before serving: every snapshot of this actor
 	// then contains an open guest handle on a system-info file (see
 	// heldIdentity).
@@ -454,9 +665,12 @@ func main() {
 	mux.HandleFunc("/fetch", fetch)
 	mux.HandleFunc("/readfile", readfile)
 	mux.HandleFunc("/writefile", writefile)
+	mux.HandleFunc("/lookup", lookup)
+	mux.HandleFunc("/stat", stat)
 	mux.HandleFunc("/resources", resources)
 	mux.HandleFunc("/capabilities", capabilities)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/filesystem", filesystem)
+	mux.HandleFunc("/healthz", healthz)
 
 	const addr = ":80"
 	log.Printf("probe listening on %s", addr)

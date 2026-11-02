@@ -17,8 +17,8 @@ package apivalidation
 import (
 	"context"
 
-	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
-	"github.com/agent-substrate/substrate/internal/resources"
+	"go.ate.dev/substrate/internal/proto/ateletpb"
+	"go.ate.dev/substrate/internal/resources"
 	"k8s.io/apimachinery/pkg/api/operation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
@@ -28,9 +28,55 @@ func ValidateRequestActorSuspendRequest(ctx context.Context, req *ateletpb.Reque
 	return Validate_RequestActorSuspendRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
 }
 
+// ValidateReportActorCrashedRequest runs the generated validation for req.
+func ValidateReportActorCrashedRequest(ctx context.Context, req *ateletpb.ReportActorCrashedRequest) field.ErrorList {
+	return Validate_ReportActorCrashedRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidateGetActorEgressPolicyRequest runs the generated validation for
+// req.
+func ValidateGetActorEgressPolicyRequest(ctx context.Context, req *ateletpb.GetActorEgressPolicyRequest) field.ErrorList {
+	return Validate_GetActorEgressPolicyRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
 // ValidateMintActorCertificateRequest runs the generated validation for req.
 func ValidateMintActorCertificateRequest(ctx context.Context, req *ateletpb.MintActorCertificateRequest) field.ErrorList {
 	return Validate_MintActorCertificateRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidateRunRequest runs the generated validation for req.
+func ValidateRunRequest(ctx context.Context, req *ateletpb.RunRequest) field.ErrorList {
+	return Validate_RunRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidateTerminateRequest runs the generated validation for req.
+func ValidateTerminateRequest(ctx context.Context, req *ateletpb.TerminateRequest) field.ErrorList {
+	return Validate_TerminateRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidateCheckpointRequest runs the generated validation for req.
+func ValidateCheckpointRequest(ctx context.Context, req *ateletpb.CheckpointRequest) field.ErrorList {
+	return Validate_CheckpointRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidateRestoreRequest runs the generated validation for req.
+func ValidateRestoreRequest(ctx context.Context, req *ateletpb.RestoreRequest) field.ErrorList {
+	return Validate_RestoreRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidatePromoteSnapshotRequest runs the generated validation for req.
+func ValidatePromoteSnapshotRequest(ctx context.Context, req *ateletpb.PromoteSnapshotRequest) field.ErrorList {
+	return Validate_PromoteSnapshotRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidateDetachActorRequest runs the generated validation for req.
+func ValidateDetachActorRequest(ctx context.Context, req *ateletpb.DetachActorRequest) field.ErrorList {
+	return Validate_DetachActorRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
+}
+
+// ValidateSetWorkerSandboxRuntimesRequest runs the generated validation for req.
+func ValidateSetWorkerSandboxRuntimesRequest(ctx context.Context, req *ateletpb.SetWorkerSandboxRuntimesRequest) field.ErrorList {
+	return Validate_SetWorkerSandboxRuntimesRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
 }
 
 // ValidateRegisterWorkerRequest runs the generated validation for req.
@@ -38,11 +84,29 @@ func ValidateRegisterWorkerRequest(ctx context.Context, req *ateletpb.RegisterWo
 	return Validate_RegisterWorkerRequest(ctx, operation.Operation{Type: operation.Create}, nil, req, nil)
 }
 
-// ValidateCustom_Limits validates one limit with resources.ValidateLimit, the
-// rule the control plane applies to its own Limits. Presence and uniqueness
-// of names are enforced by tags.
-func ValidateCustom_Limits(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *ateletpb.Limits) field.ErrorList {
-	return resources.ValidateLimit(fldPath, value.GetName(), value.GetQuantity())
+func ValidateCustom_EgressGateway_Address(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return resources.ValidateHostPort(fldPath, *value)
+}
+
+func ValidateCustom_ActorSandboxRuntime_SandboxClass(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return resources.ValidateSandboxClass(fldPath, *value)
+}
+
+func ValidateCustom_WorkerSandboxClass_SandboxClass(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return resources.ValidateSandboxClass(fldPath, *value)
+}
+
+func ValidateCustom_ObjectStorage_SnapshotUri(_ context.Context, _ operation.Operation, fldPath *field.Path, value, _ *string) field.ErrorList {
+	return validateSnapshotURI(fldPath, *value)
+}
+
+// validateSnapshotURI requires a snapshot URI that resources.ParseSnapshotURI
+// accepts.
+func validateSnapshotURI(fldPath *field.Path, uri string) field.ErrorList {
+	if _, err := resources.ParseSnapshotURI(uri); err != nil {
+		return field.ErrorList{field.Invalid(fldPath, uri, err.Error())}
+	}
+	return nil
 }
 
 // ateDeepEqual is the deep-equal function declarative validation's generated

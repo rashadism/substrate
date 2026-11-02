@@ -19,14 +19,24 @@ import (
 	"path/filepath"
 )
 
+// FSCheckpointSubdir is the subdirectory under the checkpoint directory where
+// durable-dir filesystem checkpoint files are stored.
+const FSCheckpointSubdir = "fs"
+
+// RootfsCheckpointSubdir is the subdirectory under the checkpoint directory
+// where container rootfs filesystem checkpoint files are stored.
+const RootfsCheckpointSubdir = "rootfs"
+
 // ValidateSnapshotFileNames requires each name to be a distinct plain file name
-// in the checkpoint directory. Actual file access must still use os.Root so
-// symlinks cannot escape that directory.
+// in the checkpoint directory or its "fs" or "rootfs" subdirectories. Actual
+// file access must still use os.Root so symlinks cannot escape that directory.
 func ValidateSnapshotFileNames(files []string) error {
 	seen := make(map[string]bool, len(files))
 	for i, name := range files {
+		dir := filepath.Dir(name)
+		base := filepath.Base(name)
 		switch {
-		case name != filepath.Base(name) || !filepath.IsLocal(name) || name == ".":
+		case !filepath.IsLocal(name) || name != filepath.Clean(name) || base == "." || (dir != "." && dir != FSCheckpointSubdir && dir != RootfsCheckpointSubdir):
 			return fmt.Errorf("snapshotFiles[%d] %q is not a file name in the checkpoint directory", i, name)
 		case seen[name]:
 			return fmt.Errorf("snapshotFiles[%d] %q is duplicated", i, name)

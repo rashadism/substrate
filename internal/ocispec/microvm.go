@@ -18,12 +18,13 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
-	"github.com/agent-substrate/substrate/internal/imagecache"
-	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"go.ate.dev/substrate/internal/imagecache"
+	"go.ate.dev/substrate/internal/proto/ateworkerpb"
 )
 
 // Sub-share names inside the micro-VM virtio-fs share.
@@ -39,18 +40,29 @@ const (
 	ShareVolumes    = "volumes"
 )
 
+// GuestContainerID returns the kata container ID for a container name.
+//
+// kata requires IDs of at least two characters, and a name can be one.
+// '_' is not valid in a name, so the ID can't collide with another name or
+// the Share* dirs. It must only depend on the name, since a restored guest
+// keeps the IDs it booted with.
+// https://github.com/kata-containers/kata-containers/blob/4.1.0/src/libs/kata-sys-util/src/validate.rs#L17-L22
+func GuestContainerID(name string) string { return "c_" + name }
+
 // MicroVMOptions describes the micro-VM context of one actor container.
 type MicroVMOptions struct {
 	// ActorDirs are the actor's directories; volume bind sources under them are
 	// staged into the share.
-	ActorDirs   *ateompb.ActorDirs
-	ContainerID string
+	ActorDirs     *ateworkerpb.ActorDirs
+	ContainerName string
 }
 
 // ShapeMicroVM replaces host system mounts with guest mounts, repoints volume
-// bind mounts to guest share paths, and fills in kata's default resources. It
-// must run on an unshaped spec, and errors on a bind it cannot place in the
-// guest.
+// bind mounts to guest share paths, applies containerd's default read-only
+// paths and the subset of its default masked paths that exists in the guest,
+// fills in kata's default resources, and lifts the guest's privileged-port
+// limit. It must run on an unshaped spec, and errors on a bind it cannot place
+// in the guest.
 func ShapeMicroVM(spec *specs.Spec, o MicroVMOptions) error {
 	// Translate volume bind mounts into guest share paths.
 	volumes := make([]specs.Mount, 0, len(spec.Mounts))
@@ -58,7 +70,7 @@ func ShapeMicroVM(spec *specs.Spec, o MicroVMOptions) error {
 		if m.Type != "bind" {
 			continue
 		}
-		src, err := guestVolumeSource(m.Source, o.ActorDirs, o.ContainerID)
+		src, err := guestVolumeSource(m.Source, o.ActorDirs, o.ContainerName)
 		if err != nil {
 			return fmt.Errorf("mount %q: %w", m.Destination, err)
 		}
@@ -77,6 +89,17 @@ func ShapeMicroVM(spec *specs.Spec, o MicroVMOptions) error {
 	if spec.Linux == nil {
 		spec.Linux = &specs.Linux{}
 	}
+	// gVisor has no privileged-port limit, and runsc ignores this key.
+	if spec.Linux.Sysctl == nil {
+		spec.Linux.Sysctl = map[string]string{}
+	}
+	if _, ok := spec.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"]; !ok {
+		spec.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"] = "0"
+	}
+	// gVisor needs neither list: its procfs and sysfs leave out the masked
+	// files and keep most of /proc/sys read-only.
+	spec.Linux.MaskedPaths = guestMaskedFilePaths()
+	spec.Linux.ReadonlyPaths = guestReadonlyPaths()
 	// The container's own declared limits survive the merge; StartRootfsContainer
 	// sets CgroupsPath.
 	spec.Linux.Resources = mergeKataResources(spec.Linux.Resources)
@@ -112,12 +135,12 @@ func mergeKataResources(from *specs.LinuxResources) *specs.LinuxResources {
 }
 
 // guestVolumeSource maps a volume's host directory to its guest path.
-func guestVolumeSource(hostPath string, actorDirs *ateompb.ActorDirs, containerID string) (string, error) {
+func guestVolumeSource(hostPath string, actorDirs *ateworkerpb.ActorDirs, containerName string) (string, error) {
 	for _, staged := range []struct{ host, guest string }{
 		{actorDirs.GetDurableDirVolumeMountsDir(), path.Join(GuestSharedDir, ShareDurable)},
-		{actorDirs.GetVolumesDir(), path.Join(GuestSharedDir, ShareCSI)},
+		{actorDirs.GetExternalVolumeMountsDir(), path.Join(GuestSharedDir, ShareCSI)},
 		{actorDirs.GetSystemInfoVolumeRootsDir(), path.Join(GuestSharedDir, ShareSystemInfo)},
-		{imagecache.ImageVolumeMountPath(filepath.Join(actorDirs.GetOciBundleDir(), containerID), ""), path.Join(GuestSharedDir, containerID, ShareVolumes)},
+		{imagecache.ImageVolumeMountPath(filepath.Join(actorDirs.GetOciBundleDir(), containerName), ""), path.Join(GuestSharedDir, GuestContainerID(containerName), ShareVolumes)},
 	} {
 		if rel, ok := strings.CutPrefix(hostPath, staged.host+"/"); ok {
 			return path.Join(staged.guest, rel), nil
@@ -126,9 +149,10 @@ func guestVolumeSource(hostPath string, actorDirs *ateompb.ActorDirs, containerI
 	return "", fmt.Errorf("host path %q is not staged into the guest share", hostPath)
 }
 
-// guestSystemMounts returns the standard kata guest mount set.
+// guestSystemMounts returns the standard kata guest mount set, followed by a
+// read-only tmpfs over each of guestMaskedDirPaths.
 func guestSystemMounts() []specs.Mount {
-	return []specs.Mount{
+	mounts := []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
@@ -136,6 +160,57 @@ func guestSystemMounts() []specs.Mount {
 		{Destination: "/dev/mqueue", Type: "mqueue", Source: "mqueue", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/run", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+	}
+	// Mask each directory with a read-only tmpfs, as runc's maskDir does.
+	// https://github.com/opencontainers/runc/blob/7d36b05953ebb377900a0a565d8b0754e464be0b/libcontainer/rootfs_linux.go#L1338-L1350
+	for _, dir := range guestMaskedDirPaths(runtime.GOARCH) {
+		mounts = append(mounts, specs.Mount{Destination: dir, Type: "tmpfs", Source: "tmpfs", Options: []string{"ro", "nr_blocks=1", "nr_inodes=1"}})
+	}
+	return mounts
+}
+
+// guestMaskedDirPaths returns containerd's default masked directories that
+// exist in the guest. The others don't, and kata-agent fails container start on
+// a missing mount target. goarch is the guest's architecture, which is the
+// host's under KVM. arm64 guests boot without ACPI.
+// https://github.com/containerd/containerd/blob/v2.4.2/pkg/oci/spec.go#L262-L276
+// TODO(#3530): Remove once kata-agent masks directories itself.
+func guestMaskedDirPaths(goarch string) []string {
+	if goarch == "amd64" {
+		return []string{
+			"/sys/firmware",
+			"/proc/acpi",
+		}
+	}
+	return []string{
+		"/sys/firmware",
+	}
+}
+
+// guestMaskedFilePaths returns containerd's default masked paths that are
+// files. kata-agent masks them by bind-mounting /dev/null, and skips
+// directories.
+// https://github.com/containerd/containerd/blob/v2.4.2/pkg/oci/spec.go#L262-L276
+func guestMaskedFilePaths() []string {
+	return []string{
+		"/proc/interrupts",
+		"/proc/kcore",
+		"/proc/keys",
+		"/proc/latency_stats",
+		"/proc/timer_list",
+		"/proc/timer_stats",
+		"/proc/sched_debug",
+	}
+}
+
+// guestReadonlyPaths returns containerd's default read-only paths.
+func guestReadonlyPaths() []string {
+	return []string{
+		"/proc/bus",
+		"/proc/fs",
+		"/proc/irq",
+		"/proc/sys",
+		"/proc/sysrq-trigger",
 	}
 }
 
