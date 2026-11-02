@@ -1,3 +1,4 @@
+{{- if .Values.rustfs.enabled }}
 {{- $existing := lookup "v1" "Secret" "ate-system" "rustfs-credentials" }}
 {{- $accessKey := .Values.rustfs.accessKey }}
 {{- $secretKey := .Values.rustfs.secretKey }}
@@ -160,3 +161,4 @@ spec:
           done
           echo "timed out waiting for rustfs"
           exit 1
+{{- end }}

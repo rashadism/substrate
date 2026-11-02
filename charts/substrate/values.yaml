@@ -107,6 +107,13 @@ gcpManagedPrometheus:
   enabled: false
 
 rustfs:
+  # Set to false to run every snapshot-capable component against your own
+  # S3-compatible bucket instead - rustfs.yaml's Deployment, PVC, bucket-init
+  # Job and generated credentials Secret are all skipped, and
+  # snapshotStorage.* below becomes required. Snapshots are the one thing
+  # this chart cannot run without somewhere to put them; the bundled rustfs
+  # is a default, not a requirement.
+  enabled: true
   image: "rustfs/rustfs:1.0.0-beta.3@sha256:378642b05b7dcb4849fb77ebe6aca4ced1c3f66e7e504247df95a5c9018d3358"
   bucketInitImage: "amazon/aws-cli:2.17.0@sha256:643507c10ada7964ca6157b3d799f030b90577643da9955d319a77399ed80d73"
   bucket: ate-snapshots
@@ -124,6 +131,17 @@ rustfs:
     requests:
       cpu: 10m
       memory: 32Mi
+
+# Consulted only when rustfs.enabled is false. Every field is required in
+# that case - there's no sane default for somebody else's bucket.
+snapshotStorage:
+  endpointURL: ""
+  region: "us-east-1"
+  usePathStyle: true
+  credentialsSecretRef:
+    name: ""
+    accessKeyKey: "access-key"
+    secretKeyKey: "secret-key"
 
 # Connection strings come from Secrets rendered by the substrate-postgres
 # chart (or your own, for an externally managed database). schema/ownerRole/

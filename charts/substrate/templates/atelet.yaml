@@ -124,24 +124,7 @@ spec:
         resources:
           {{- toYaml .Values.atelet.snapshotPluginResources | nindent 10 }}
         env:
-        - name: ATE_STORAGE_BACKEND
-          value: "s3"
-        - name: AWS_ENDPOINT_URL
-          value: "http://rustfs.ate-system.svc:9000"
-        - name: AWS_REGION
-          value: "us-east-1"
-        - name: AWS_S3_USE_PATH_STYLE
-          value: "true"
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef:
-              name: rustfs-credentials
-              key: access-key
-        - name: AWS_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef:
-              name: rustfs-credentials
-              key: secret-key
+        {{- include "substrate.snapshotStorageEnv" . | nindent 8 }}
         envFrom:
         - configMapRef:
             name: ate-otel-config
@@ -200,24 +183,7 @@ spec:
               fieldPath: metadata.uid
         - name: OTEL_RESOURCE_ATTRIBUTES
           value: k8s.namespace.name=$(POD_NAMESPACE),k8s.pod.name=$(POD_NAME),k8s.pod.uid=$(POD_UID),k8s.node.name=$(NODE_NAME),service.instance.id=$(POD_UID)
-        - name: ATE_STORAGE_BACKEND
-          value: "s3"
-        - name: AWS_ENDPOINT_URL
-          value: "http://rustfs.ate-system.svc:9000"
-        - name: AWS_REGION
-          value: "us-east-1"
-        - name: AWS_S3_USE_PATH_STYLE
-          value: "true"
-        - name: AWS_ACCESS_KEY_ID
-          valueFrom:
-            secretKeyRef:
-              name: rustfs-credentials
-              key: access-key
-        - name: AWS_SECRET_ACCESS_KEY
-          valueFrom:
-            secretKeyRef:
-              name: rustfs-credentials
-              key: secret-key
+        {{- include "substrate.snapshotStorageEnv" . | nindent 8 }}
         envFrom:
         - configMapRef:
             name: ate-otel-config
