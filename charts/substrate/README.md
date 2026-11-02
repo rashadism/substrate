@@ -21,6 +21,7 @@ Unlike PostgreSQL's role/schema setup, this chart's CA pools, JWT authority pool
 
 | Value | Default | Description |
 |---|---|---|
+| `createNamespace` | `true` | Set to `false` under GitOps, where something else owns `ate-system`'s and `podcertificate-controller-system`'s lifecycle |
 | `otel.endpoint` | `http://localhost:4317` | Shared OTLP endpoint every component exports through; a harmless default since logs/metrics collection is out of scope for this chart |
 | `atelet.imageCredentialProviderBinDir`, `atelet.imageCredentialProviderConfig` | GKE paths | Kubelet image-credential-provider paths; set these for your node distribution |
 | `ateApiServer.replicas` | `2` | `ate-api-server` replica count |
@@ -36,3 +37,4 @@ Unlike PostgreSQL's role/schema setup, this chart's CA pools, JWT authority pool
 | `postgres.schema`, `postgres.ownerRole`, `postgres.readWriteRole` | `substrate`, `substrate_owner`, `substrate_readwrite` | Must match the `substrate-postgres` chart's corresponding `postgres.*` values |
 | `sandboxConfig.gvisor` | see `values.yaml` | The default gVisor `SandboxConfig`'s pinned pause image and per-architecture asset URLs |
 | `<component>.resources`, and a second `<component>.<sidecar>Resources` for the few components with a sidecar/init container | see `values.yaml` | Plain Kubernetes requests/limits per container, defaulted conservatively |
+| `atelet.extraArgs`, `atelet.extraEnv`, `ateApiServer.extraArgs`, `ateApiServer.extraEnv` | `[]` | Extra CLI args/env vars for an installer-specific knob this chart doesn't expose yet, without forking it |

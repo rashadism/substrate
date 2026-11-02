@@ -108,6 +108,9 @@ spec:
           - --drain-timeout=15s
           - --snapshot-plugin-socket=/run/snapshot-plugin/control.sock
           - --authz-bootstrap-owners={{ required "ateApiServer.authorization.bootstrapOwners must list at least one principal - ate-api-server refuses to start without it" (join "," .Values.ateApiServer.authorization.bootstrapOwners) }}
+          {{- with .Values.ateApiServer.extraArgs }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
         env:
         - name: POD_NAME
           valueFrom:
@@ -141,6 +144,9 @@ spec:
           value: {{ .Values.postgres.schema | quote }}
         - name: ATE_API_ACTOR_JWT_ISSUER
           value: {{ .Values.ateApiServer.actorJWTIssuer | quote }}
+        {{- with .Values.ateApiServer.extraEnv }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         envFrom:
         - configMapRef:
             name: ate-otel-config

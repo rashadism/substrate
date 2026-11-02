@@ -1,3 +1,10 @@
+# Set to false on a cluster where something else (Flux, Argo, a cluster
+# admin) owns ate-system's and podcertificate-controller-system's
+# lifecycle - a chart that creates namespaces unconditionally is
+# drift-detection noise under GitOps. Off assumes both namespaces already
+# exist or you're installing with `--create-namespace`.
+createNamespace: true
+
 # Every component shares this OTLP endpoint via envFrom. Logs/metrics are
 # out of scope for this chart, so it only needs to exist.
 otel:
@@ -40,6 +47,11 @@ atelet:
     requests:
       cpu: 50m
       memory: 128Mi
+  # Extra atelet CLI args/env vars for an installer-specific knob this chart
+  # doesn't expose yet, without forking it. extraArgs items are plain
+  # strings ("--flag=value"); extraEnv items are ordinary EnvVar objects.
+  extraArgs: []
+  extraEnv: []
 
 ateController:
   image: ""
@@ -73,6 +85,9 @@ ateApiServer:
     requests:
       cpu: 20m
       memory: 64Mi
+  # Same escape hatch as atelet's, for ate-api-server's own CLI/env.
+  extraArgs: []
+  extraEnv: []
 
 atenetRouter:
   image: ""
