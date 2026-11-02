@@ -26,13 +26,13 @@ Unlike PostgreSQL's role/schema setup, this chart's CA pools, JWT authority pool
 | `atelet.imageCredentialProviderBinDir`, `atelet.imageCredentialProviderConfig` | GKE paths | Kubelet image-credential-provider paths; set these for your node distribution |
 | `ateApiServer.replicas` | `2` | `ate-api-server` replica count |
 | `ateApiServer.actorJWTIssuer` | this chart's own `api` Service | Issuer URL placed in actor JWTs; must be HTTPS with no query or fragment |
-| `ateApiServer.authorization.bootstrapOwners` | `[]` (**required**) | Principal IDs always treated as global AuthZ owners; `ate-api-server` refuses to start with none set, so this chart's default install will not come up until you set it |
+| `ateApiServer.authorization.bootstrapOwners` | `[]` (**required**) | Principal IDs treated as global AuthZ owners; `ate-api-server` refuses to start with none set |
 | `atenetRouter.envoyImage`, `atenetEgress.envoyImage` | pinned digest | Envoy builds for the router and egress gateway |
-| `atenetRouter.ingressAllowedSPIFFEIDs` | `[]` | SPIFFE IDs allowed to connect to actors through the ingress dataplane; empty matches the router's own default of serving no ingress traffic at all |
+| `atenetRouter.ingressAllowedSPIFFEIDs` | `[]` | SPIFFE IDs allowed through the ingress dataplane; empty means no ingress traffic |
 | `gcpManagedPrometheus.enabled` | `false` | Renders a GKE-only `PodMonitoring` for the router's Envoy sidecar |
-| `rustfs.enabled` | `true` | Set to `false` to skip the bundled rustfs entirely (Deployment, PVC, bucket-init Job, generated credentials Secret) and use `snapshotStorage.*` instead |
+| `rustfs.enabled` | `true` | Set to `false` to use `snapshotStorage.*` instead of the bundled rustfs |
 | `rustfs.accessKey`, `rustfs.secretKey` | generated | Left unset; the chart generates and persists a random pair on first install rather than shipping a fixed credential |
-| `snapshotStorage.*` | see `values.yaml` | Required only when `rustfs.enabled` is `false`: endpoint, region, path-style flag, and a `Secret` reference for your own S3-compatible bucket |
+| `snapshotStorage.*` | see `values.yaml` | Required only when `rustfs.enabled` is `false` |
 | `postgres.readWriteConnectionStringSecretRef.name`, `postgres.ownerConnectionStringSecretRef.name` | `substrate-postgres-readwrite`, `substrate-postgres-owner` | Secrets this chart reads the PostgreSQL connection strings from, each under the key `connectionString` |
 | `postgres.schema`, `postgres.ownerRole`, `postgres.readWriteRole` | `substrate`, `substrate_owner`, `substrate_readwrite` | Must match the `substrate-postgres` chart's corresponding `postgres.*` values |
 | `sandboxConfig.gvisor` | see `values.yaml` | The default gVisor `SandboxConfig`'s pinned pause image and per-architecture asset URLs |

@@ -1,8 +1,5 @@
-# Set to false on a cluster where something else (Flux, Argo, a cluster
-# admin) owns ate-system's and podcertificate-controller-system's
-# lifecycle - a chart that creates namespaces unconditionally is
-# drift-detection noise under GitOps. Off assumes both namespaces already
-# exist or you're installing with `--create-namespace`.
+# Set to false under GitOps, where something else owns the namespaces'
+# lifecycle.
 createNamespace: true
 
 # Every component shares this OTLP endpoint via envFrom. Logs/metrics are
@@ -12,14 +9,11 @@ otel:
 
 # No pre-built image is published for any component here - build from source.
 #
-# Every component below also takes a `resources` (and, for the two components
-# with a second container, an extra `*Resources`) field: plain
-# requests/limits, defaulted conservatively and requests-only where nothing
-# here already ran with hard limits in practice. Override per environment;
-# none of these numbers are load-tested, just non-zero.
+# Every component below also takes a `resources` field (and a second
+# `*Resources` for the few with a sidecar/init container); defaults are
+# conservative, not load-tested.
 ateSetup:
   image: ""
-  # The one-shot identity/CA bootstrap Job.
   resources:
     requests:
       cpu: 10m
@@ -47,9 +41,7 @@ atelet:
     requests:
       cpu: 50m
       memory: 128Mi
-  # Extra atelet CLI args/env vars for an installer-specific knob this chart
-  # doesn't expose yet, without forking it. extraArgs items are plain
-  # strings ("--flag=value"); extraEnv items are ordinary EnvVar objects.
+  # Escape hatch for a CLI flag or env var this chart doesn't expose yet.
   extraArgs: []
   extraEnv: []
 
@@ -69,13 +61,8 @@ ateApiServer:
   # document relying parties fetch.
   actorJWTIssuer: "https://api.ate-system.svc"
   authorization:
-    # Principal IDs that are always global AuthZ owners, independent of the
-    # stored AccessPolicy - ate-api-server's --authz-bootstrap-owners.
-    # ate-api-server refuses to start without at least one of these set;
-    # there is no safe default to ship, so this chart's default (empty)
-    # will not come up until you set it. A principal ID here is whatever
-    # authn produced for it - a Kubernetes ServiceAccount's bound-token
-    # subject, an OIDC subject, or a SPIFFE ID for an mTLS caller.
+    # ate-api-server's --authz-bootstrap-owners. Required - it refuses to
+    # start with none set.
     bootstrapOwners: []
   resources:
     requests:
@@ -85,18 +72,14 @@ ateApiServer:
     requests:
       cpu: 20m
       memory: 64Mi
-  # Same escape hatch as atelet's, for ate-api-server's own CLI/env.
   extraArgs: []
   extraEnv: []
 
 atenetRouter:
   image: ""
   envoyImage: "envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
-  # SPIFFE IDs (exact match) allowed to connect to actors through the
-  # ingress dataplane - atenet-router's --ingress-allowed-spiffe-ids.
-  # Empty is the router's own default, and its own default is to serve no
-  # ingress traffic at all - there's no unsafe default to accidentally
-  # ship here, only an inert one until you list your actual callers.
+  # atenet-router's --ingress-allowed-spiffe-ids. Empty (the router's own
+  # default) serves no ingress traffic at all.
   ingressAllowedSPIFFEIDs: []
   resources:
     requests:
@@ -112,9 +95,6 @@ atenetEgress:
   # Upstream substitutes this outside kustomize (${ENVOY_DATAPLANE_IMAGE}), so
   # there's no natural default; defaults here to the router's Envoy build.
   envoyImage: "envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
-  # sdsmint is a native sidecar minting short-lived MITM leaf certs; a memory
-  # limit with no CPU limit matches how it already ran before this was made
-  # configurable.
   resources:
     requests:
       cpu: 200m
@@ -125,7 +105,6 @@ atenetEgress:
     requests:
       cpu: 200m
       memory: 512Mi
-  # The co-located ext_proc server (the atenet binary itself, --mode=egress).
   extProcResources:
     requests:
       cpu: 50m
@@ -137,12 +116,8 @@ gcpManagedPrometheus:
   enabled: false
 
 rustfs:
-  # Set to false to run every snapshot-capable component against your own
-  # S3-compatible bucket instead - rustfs.yaml's Deployment, PVC, bucket-init
-  # Job and generated credentials Secret are all skipped, and
-  # snapshotStorage.* below becomes required. Snapshots are the one thing
-  # this chart cannot run without somewhere to put them; the bundled rustfs
-  # is a default, not a requirement.
+  # Set to false to use your own S3-compatible bucket via snapshotStorage.*
+  # instead of the bundled one.
   enabled: true
   image: "rustfs/rustfs:1.0.0-beta.3@sha256:378642b05b7dcb4849fb77ebe6aca4ced1c3f66e7e504247df95a5c9018d3358"
   bucketInitImage: "amazon/aws-cli:2.17.0@sha256:643507c10ada7964ca6157b3d799f030b90577643da9955d319a77399ed80d73"
@@ -156,14 +131,12 @@ rustfs:
     requests:
       cpu: 100m
       memory: 256Mi
-  # The one-shot `aws s3 mb` Job that creates the snapshot bucket.
   bucketInitResources:
     requests:
       cpu: 10m
       memory: 32Mi
 
-# Consulted only when rustfs.enabled is false. Every field is required in
-# that case - there's no sane default for somebody else's bucket.
+# Required when rustfs.enabled is false; ignored otherwise.
 snapshotStorage:
   endpointURL: ""
   region: "us-east-1"

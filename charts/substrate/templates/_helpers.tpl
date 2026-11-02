@@ -15,17 +15,9 @@ limitations under the License.
 */}}
 
 {{/*
-substrate.snapshotStorageEnv renders the S3-compatible storage env vars
-every snapshot-plugin and atelet container needs. Rendered identically in
-three places (ate-api-server's snapshot-plugin init container, atelet's
-snapshot-plugin init container, and atelet's own main container), so it
-lives here once instead of three times.
-
-With rustfs.enabled (the default), it points at the bundled in-cluster
-rustfs instance and its auto-generated credentials Secret. Otherwise it
-requires snapshotStorage.* to name your own S3-compatible bucket and the
-Secret holding its credentials - rustfs.yaml itself is skipped entirely in
-that case (see rustfs.enabled's own comment in values.yaml).
+substrate.snapshotStorageEnv: the S3-compatible storage env vars, shared by
+the three containers that need them. Points at rustfs or snapshotStorage.*
+depending on rustfs.enabled.
 */}}
 {{- define "substrate.snapshotStorageEnv" -}}
 - name: ATE_STORAGE_BACKEND
