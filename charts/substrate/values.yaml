@@ -4,12 +4,27 @@ otel:
   endpoint: "http://localhost:4317"
 
 # No pre-built image is published for any component here - build from source.
+#
+# Every component below also takes a `resources` (and, for the two components
+# with a second container, an extra `*Resources`) field: plain
+# requests/limits, defaulted conservatively and requests-only where nothing
+# here already ran with hard limits in practice. Override per environment;
+# none of these numbers are load-tested, just non-zero.
 ateSetup:
   image: ""
+  # The one-shot identity/CA bootstrap Job.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
 
 podCertificateController:
   image: ""
   workersPerSigner: "1"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
 
 atelet:
   image: ""
@@ -17,9 +32,21 @@ atelet:
   # GKE's kubelet credential-provider paths; other node distributions differ.
   imageCredentialProviderBinDir: "/home/kubernetes/bin"
   imageCredentialProviderConfig: "/etc/srv/kubernetes/cri_auth_config.yaml"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+  snapshotPluginResources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
 
 ateController:
   image: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
 
 ateApiServer:
   image: ""
@@ -29,16 +56,50 @@ ateApiServer:
   # Defaults to this chart's own api Service, which publishes the discovery
   # document relying parties fetch.
   actorJWTIssuer: "https://api.ate-system.svc"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  snapshotPluginResources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
 
 atenetRouter:
   image: ""
   envoyImage: "envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+  envoyResources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
 
 atenetEgress:
   image: ""
   # Upstream substitutes this outside kustomize (${ENVOY_DATAPLANE_IMAGE}), so
   # there's no natural default; defaults here to the router's Envoy build.
   envoyImage: "envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
+  # sdsmint is a native sidecar minting short-lived MITM leaf certs; a memory
+  # limit with no CPU limit matches how it already ran before this was made
+  # configurable.
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 768Mi
+  envoyResources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+  # The co-located ext_proc server (the atenet binary itself, --mode=egress).
+  extProcResources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
 
 # GKE-only (monitoring.googleapis.com/v1 PodMonitoring); off by default to
 # keep the chart cloud-neutral.
@@ -54,6 +115,15 @@ rustfs:
   # first install. Set both to pin specific values.
   accessKey: ""
   secretKey: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+  # The one-shot `aws s3 mb` Job that creates the snapshot bucket.
+  bucketInitResources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
 
 # Connection strings come from Secrets rendered by the substrate-postgres
 # chart (or your own, for an externally managed database). schema/ownerRole/

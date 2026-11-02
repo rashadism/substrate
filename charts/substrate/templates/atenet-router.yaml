@@ -222,6 +222,8 @@ spec:
           mountPath: "/run/servicedns-ca"
         - name: "drain-signal"
           mountPath: "/var/run/atenet"
+        resources:
+          {{- toYaml .Values.atenetRouter.resources | nindent 10 }}
       - name: envoy
         image: {{ .Values.atenetRouter.envoyImage }}
         command:
@@ -258,6 +260,8 @@ spec:
         - name: "drain-signal"
           mountPath: "/var/run/atenet"
           readOnly: true
+        resources:
+          {{- toYaml .Values.atenetRouter.envoyResources | nindent 10 }}
       volumes:
       - name: envoy-config
         configMap:

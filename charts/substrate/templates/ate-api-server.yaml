@@ -99,6 +99,8 @@ spec:
         envFrom:
         - configMapRef:
             name: ate-otel-config
+        resources:
+          {{- toYaml .Values.ateApiServer.snapshotPluginResources | nindent 10 }}
         volumeMounts:
         - name: snapshot-plugin
           mountPath: /run/snapshot-plugin
@@ -199,6 +201,8 @@ spec:
             port: 9090
           initialDelaySeconds: 10
           periodSeconds: 10
+        resources:
+          {{- toYaml .Values.ateApiServer.resources | nindent 10 }}
       volumes:
       - name: snapshot-plugin
         emptyDir: {}

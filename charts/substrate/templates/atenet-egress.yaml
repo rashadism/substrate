@@ -882,11 +882,7 @@ spec:
         - name: GOMEMLIMIT
           value: "640MiB"
         resources:
-          requests:
-            cpu: 200m
-            memory: 512Mi
-          limits:
-            memory: 768Mi
+          {{- toYaml .Values.atenetEgress.resources | nindent 10 }}
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true
@@ -956,6 +952,8 @@ spec:
           readOnly: true
         - name: sdsmint-sock
           mountPath: /var/run/sdsmint
+        resources:
+          {{- toYaml .Values.atenetEgress.envoyResources | nindent 10 }}
       # Co-located ext_proc server: the same atenet binary the ingress
       # gateway runs, started with --mode=egress so it serves only the
       # egress ext_proc handler (no xDS server, no Kubernetes access).
@@ -1015,6 +1013,8 @@ spec:
           readOnly: true
         - name: drain-signal
           mountPath: /var/run/atenet
+        resources:
+          {{- toYaml .Values.atenetEgress.extProcResources | nindent 10 }}
       volumes:
       - name: config
         configMap:

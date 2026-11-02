@@ -150,9 +150,7 @@ spec:
             drop:
             - ALL
         resources:
-          requests:
-            cpu: 10m
-            memory: 32Mi
+          {{- toYaml .Values.ateSetup.resources | nindent 10 }}
         command:
         - /bin/sh
         - -c

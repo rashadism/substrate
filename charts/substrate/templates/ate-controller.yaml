@@ -153,6 +153,8 @@ spec:
           mountPath: "/run/podidentity.podcert.ate.dev"
         - name: "servicedns-ca"
           mountPath: "/run/servicedns-ca"
+        resources:
+          {{- toYaml .Values.ateController.resources | nindent 10 }}
       volumes:
       - name: "podidentity"
         projected:

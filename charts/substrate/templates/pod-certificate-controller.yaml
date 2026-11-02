@@ -3,6 +3,12 @@ kind: Namespace
 metadata:
   name: podcertificate-controller-system
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: podcertificate-controller
+  namespace: podcertificate-controller-system
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -39,7 +45,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   namespace: podcertificate-controller-system
-  name: default
+  name: podcertificate-controller
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -63,7 +69,7 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   namespace: podcertificate-controller-system
-  name: default
+  name: podcertificate-controller
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -122,6 +128,8 @@ spec:
             drop:
             - ALL
           readOnlyRootFilesystem: true
+        resources:
+          {{- toYaml .Values.podCertificateController.resources | nindent 10 }}
       volumes:
       - name: "ca-state"
         projected:
@@ -147,5 +155,5 @@ spec:
       restartPolicy: Always
       schedulerName: default-scheduler
       securityContext: {}
-      serviceAccountName: default
+      serviceAccountName: podcertificate-controller
       terminationGracePeriodSeconds: 30
