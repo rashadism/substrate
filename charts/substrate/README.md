@@ -1,13 +1,16 @@
 # substrate
 
-Agent Substrate's control plane: the CRDs, the identity/CA bootstrap, the pod-certificate controller, `atelet`, `ate-controller`, `ate-api-server`, `atenet-router`, `atenet-egress`, a bundled S3-compatible object store (rustfs) for snapshots, and a default gVisor `SandboxConfig`.
+Agent Substrate's control plane: the identity/CA bootstrap, the pod-certificate controller, `atelet`, `ate-controller`, `ate-api-server`, `atenet-router`, `atenet-egress`, a bundled S3-compatible object store (rustfs) for snapshots, and a default gVisor `SandboxConfig`.
+
+The `WorkerPool`/`SandboxConfig`/`CSIDriverConfig` CRDs live in the separate [`substrate-crds`](../substrate-crds/README.md) chart, not here — see that chart's README for why.
 
 ## Prerequisites
 
 - A Kubernetes cluster with the `ClusterTrustBundle` and `PodCertificateRequest` beta APIs enabled.
+- The `substrate-crds` chart installed first.
 - Every image this chart references built from source into a registry you control — no pre-built image is published anywhere for any component here. `ateSetup.image`, `podCertificateController.image`, `atelet.image`, `atelet.snapshotPluginImage`, `ateController.image`, `ateApiServer.image`, `ateApiServer.snapshotPluginImage`, `atenetRouter.image`, `atenetEgress.image` all need a value.
 
-Install this chart before `substrate-postgres` — its pod-certificate controller issues the certs that chart's PostgreSQL pod needs to start. `ate-api-server` sits in `CreateContainerConfigError` until `substrate-postgres`'s Secrets exist too; don't `--wait` on either chart alone.
+Install `substrate-crds`, then this chart, then `substrate-postgres` — the pod-certificate controller issues the certs that chart's PostgreSQL pod needs to start. `ate-api-server` sits in `CreateContainerConfigError` until `substrate-postgres`'s Secrets exist too; don't `--wait` on any of the three alone.
 
 ## Identity and CA bootstrap
 
