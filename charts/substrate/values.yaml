@@ -56,6 +56,15 @@ ateApiServer:
   # Defaults to this chart's own api Service, which publishes the discovery
   # document relying parties fetch.
   actorJWTIssuer: "https://api.ate-system.svc"
+  authorization:
+    # Principal IDs that are always global AuthZ owners, independent of the
+    # stored AccessPolicy - ate-api-server's --authz-bootstrap-owners.
+    # ate-api-server refuses to start without at least one of these set;
+    # there is no safe default to ship, so this chart's default (empty)
+    # will not come up until you set it. A principal ID here is whatever
+    # authn produced for it - a Kubernetes ServiceAccount's bound-token
+    # subject, an OIDC subject, or a SPIFFE ID for an mTLS caller.
+    bootstrapOwners: []
   resources:
     requests:
       cpu: 100m
@@ -68,6 +77,12 @@ ateApiServer:
 atenetRouter:
   image: ""
   envoyImage: "envoyproxy/envoy:v1.39-latest@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4"
+  # SPIFFE IDs (exact match) allowed to connect to actors through the
+  # ingress dataplane - atenet-router's --ingress-allowed-spiffe-ids.
+  # Empty is the router's own default, and its own default is to serve no
+  # ingress traffic at all - there's no unsafe default to accidentally
+  # ship here, only an inert one until you list your actual callers.
+  ingressAllowedSPIFFEIDs: []
   resources:
     requests:
       cpu: 50m

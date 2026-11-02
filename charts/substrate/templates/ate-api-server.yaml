@@ -107,6 +107,7 @@ spec:
           - --drain-delay=13s
           - --drain-timeout=15s
           - --snapshot-plugin-socket=/run/snapshot-plugin/control.sock
+          - --authz-bootstrap-owners={{ required "ateApiServer.authorization.bootstrapOwners must list at least one principal - ate-api-server refuses to start without it" (join "," .Values.ateApiServer.authorization.bootstrapOwners) }}
         env:
         - name: POD_NAME
           valueFrom:

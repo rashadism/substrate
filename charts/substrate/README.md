@@ -9,6 +9,7 @@ The `WorkerPool`/`SandboxConfig`/`CSIDriverConfig` CRDs live in the separate [`s
 - A Kubernetes cluster with the `ClusterTrustBundle` and `PodCertificateRequest` beta APIs enabled.
 - The `substrate-crds` chart installed first.
 - Every image this chart references built from source into a registry you control — no pre-built image is published anywhere for any component here. `ateSetup.image`, `podCertificateController.image`, `atelet.image`, `atelet.snapshotPluginImage`, `ateController.image`, `ateApiServer.image`, `ateApiServer.snapshotPluginImage`, `atenetRouter.image`, `atenetEgress.image` all need a value.
+- `ateApiServer.authorization.bootstrapOwners` needs at least one principal ID — `ate-api-server` exits immediately without one.
 
 Install `substrate-crds`, then this chart, then `substrate-postgres` — the pod-certificate controller issues the certs that chart's PostgreSQL pod needs to start. `ate-api-server` sits in `CreateContainerConfigError` until `substrate-postgres`'s Secrets exist too; don't `--wait` on any of the three alone.
 
@@ -24,9 +25,14 @@ Unlike PostgreSQL's role/schema setup, this chart's CA pools, JWT authority pool
 | `atelet.imageCredentialProviderBinDir`, `atelet.imageCredentialProviderConfig` | GKE paths | Kubelet image-credential-provider paths; set these for your node distribution |
 | `ateApiServer.replicas` | `2` | `ate-api-server` replica count |
 | `ateApiServer.actorJWTIssuer` | this chart's own `api` Service | Issuer URL placed in actor JWTs; must be HTTPS with no query or fragment |
+| `ateApiServer.authorization.bootstrapOwners` | `[]` (**required**) | Principal IDs always treated as global AuthZ owners; `ate-api-server` refuses to start with none set, so this chart's default install will not come up until you set it |
 | `atenetRouter.envoyImage`, `atenetEgress.envoyImage` | pinned digest | Envoy builds for the router and egress gateway |
+| `atenetRouter.ingressAllowedSPIFFEIDs` | `[]` | SPIFFE IDs allowed to connect to actors through the ingress dataplane; empty matches the router's own default of serving no ingress traffic at all |
 | `gcpManagedPrometheus.enabled` | `false` | Renders a GKE-only `PodMonitoring` for the router's Envoy sidecar |
+| `rustfs.enabled` | `true` | Set to `false` to skip the bundled rustfs entirely (Deployment, PVC, bucket-init Job, generated credentials Secret) and use `snapshotStorage.*` instead |
 | `rustfs.accessKey`, `rustfs.secretKey` | generated | Left unset; the chart generates and persists a random pair on first install rather than shipping a fixed credential |
+| `snapshotStorage.*` | see `values.yaml` | Required only when `rustfs.enabled` is `false`: endpoint, region, path-style flag, and a `Secret` reference for your own S3-compatible bucket |
 | `postgres.readWriteConnectionStringSecretRef.name`, `postgres.ownerConnectionStringSecretRef.name` | `substrate-postgres-readwrite`, `substrate-postgres-owner` | Secrets this chart reads the PostgreSQL connection strings from, each under the key `connectionString` |
 | `postgres.schema`, `postgres.ownerRole`, `postgres.readWriteRole` | `substrate`, `substrate_owner`, `substrate_readwrite` | Must match the `substrate-postgres` chart's corresponding `postgres.*` values |
 | `sandboxConfig.gvisor` | see `values.yaml` | The default gVisor `SandboxConfig`'s pinned pause image and per-architecture asset URLs |
+| `<component>.resources`, and a second `<component>.<sidecar>Resources` for the few components with a sidecar/init container | see `values.yaml` | Plain Kubernetes requests/limits per container, defaulted conservatively |
